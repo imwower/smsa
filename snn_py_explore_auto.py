@@ -12,6 +12,7 @@ from typing import Dict, List, Sequence, Tuple
 from snn.dense import DenseLIF
 from snn.lif import LIFParams, fast_sigmoid_surrogate, triangular_surrogate
 from tools.logger import get_logger, setup_logging
+import ast
 
 
 Action = int  # 0:上, 1:下, 2:左, 3:右
@@ -21,6 +22,54 @@ def patched_surrogate(u: float, gain: float = 1.5) -> float:
     """基于代码热补丁的替代导数，提供更窄的梯度窗口。"""
     denom = 1.0 + gain * u * u
     return gain / (denom * denom)
+
+
+class CodePatcher:
+    """运行时构建替代导数函数，并应用到所有神经元。"""
+
+    DEFAULT_EXPRESSIONS = [
+        "(1.0 - math.fabs(v) / (w if w > 1e-6 else 1e-6)) if math.fabs(v) <= w else 0.0",
+        "1.0 if math.fabs(v) <= w else 0.0",
+        "g / ((1.0 + g * math.fabs(v)) ** 2)",
+    ]
+
+    def __init__(self, expressions: List[str] | None = None) -> None:
+        self.expressions = expressions[:] if expressions else self.DEFAULT_EXPRESSIONS[:]
+        self.current_idx = -1
+        self.last_patch_info: str | None = None
+        self._validate_all()
+
+    def _validate_all(self) -> None:
+        for expr in self.expressions:
+            self._validate_expression(expr)
+
+    def _validate_expression(self, expr: str) -> None:
+        tree = ast.parse(expr, mode="eval")
+        allowed = {"v", "w", "g", "math"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id not in allowed:
+                raise ValueError(f"表达式包含非法标识符: {node.id}")
+
+    def _build_function(self, expr: str):
+        namespace = {"math": math}
+        code = (
+            "def dynamic_surrogate(v, w=1.0, g=2.0):\n"
+            f"    return {expr}\n"
+        )
+        exec(code, namespace, namespace)
+        return namespace["dynamic_surrogate"]
+
+    def apply(self, layer: DenseLIF, idx: int | None = None) -> str:
+        if not self.expressions:
+            raise ValueError("无可用代码热补丁表达式。")
+        if idx is None:
+            idx = (self.current_idx + 1) % len(self.expressions)
+        expr = self.expressions[idx]
+        func = self._build_function(expr)
+        layer.set_surrogate(func)
+        self.current_idx = idx
+        self.last_patch_info = f"patch surrogate idx={idx}"
+        return self.last_patch_info
 
 
 @dataclass
@@ -134,6 +183,8 @@ class SNNAgent:
         self.intrinsic_beta = intrinsic_beta
         self.surrogate_name = "fast_sigmoid"
         self.patched = False
+        self.code_patcher = CodePatcher()
+        self.last_patch_info: str | None = None
 
     def intrinsic_bonus(self, visit_count: int) -> float:
         return self.intrinsic_beta / math.sqrt(visit_count + 1)
@@ -265,39 +316,40 @@ class SNNAgent:
         self.readout_weights.pop(idx)
         return True
 
-    def apply_modification(self, action: str) -> bool:
+    def apply_modification(self, action: str) -> Tuple[bool, str | None]:
+        info: str | None = None
         if action == "eta_up":
             self.hidden_lr = min(self.hidden_lr * 1.2, 0.6)
             self.baseline_beta = min(self.baseline_beta * 1.1, 0.2)
-            return True
+            return True, info
         if action == "eta_down":
             self.hidden_lr = max(self.hidden_lr * 0.8, 0.05)
             self.baseline_beta = max(self.baseline_beta * 0.9, 0.02)
-            return True
+            return True, info
         if action == "v_th_up":
             self.hidden.params.v_th = min(self.hidden.params.v_th + 0.05, 1.2)
-            return True
+            return True, info
         if action == "v_th_down":
             self.hidden.params.v_th = max(self.hidden.params.v_th - 0.05, 0.2)
-            return True
+            return True, info
         if action == "intrinsic_up":
             self.intrinsic_beta = min(self.intrinsic_beta * 1.2, 0.8)
-            return True
+            return True, info
         if action == "intrinsic_down":
             self.intrinsic_beta = max(self.intrinsic_beta * 0.8, 0.05)
-            return True
+            return True, info
         if action == "inner_steps_up":
             self.inner_steps = min(self.inner_steps + 4, 36)
-            return True
+            return True, info
         if action == "inner_steps_down":
             if self.inner_steps <= 10:
-                return False
+                return False, info
             self.inner_steps = max(self.inner_steps - 4, 8)
-            return True
+            return True, info
         if action == "add_neuron":
-            return self.add_neuron()
+            return self.add_neuron(), info
         if action == "prune_neuron":
-            return self.prune_neuron()
+            return self.prune_neuron(), info
         if action == "switch_surrogate":
             next_name = (
                 "triangular"
@@ -305,16 +357,14 @@ class SNNAgent:
                 else "fast_sigmoid"
             )
             self.set_surrogate(next_name)
-            return True
+            return True, info
         if action == "code_patch_surrogate":
-            if self.patched:
-                self.set_surrogate("fast_sigmoid")
-                self.patched = False
-            else:
-                self.set_surrogate("patched")
-                self.patched = True
-            return True
-        return False
+            info = self.code_patcher.apply(self.hidden)
+            self.patched = True
+            self.surrogate_name = f"dynamic_{self.code_patcher.current_idx}"
+            self.last_patch_info = info
+            return True, info
+        return False, info
 
 
 def evaluate_agent(
@@ -393,7 +443,10 @@ class MetaLearner:
                 2.0 * math.log(max(total_counts, 2)) / max(self.counts[cand], 1)
             )
             score = mean + self.ucb_c * bonus
-            if score > best_score:
+            if (
+                score > best_score + 1e-9
+                or (abs(score - best_score) <= 1e-9 and random.random() < 0.5)
+            ):
                 best_score = score
                 best_candidate = cand
         return best_candidate
@@ -423,7 +476,7 @@ class MetaLearner:
             self.total_attempts += 1
             tried.append(candidate)
             backup = copy.deepcopy(agent)
-            applied = agent.apply_modification(candidate)
+            applied, info = agent.apply_modification(candidate)
             if not applied:
                 delta = -0.01
                 reverted = True
@@ -437,10 +490,7 @@ class MetaLearner:
                         reverted = False
                         self.positives += 1
                         self.update_stats(candidate, delta)
-                        msg = (
-                            f"[meta] ep {episode:03d}: (action={candidate}, Δ={delta:.3f}, "
-                            f"reverted={reverted}, pos_ratio={self.positive_ratio():.2f})"
-                        )
+                        msg = self._build_message(episode, candidate, delta, reverted, info)
                         self.logger.info(msg)
                         return agent, msg
                     agent = backup
@@ -451,21 +501,31 @@ class MetaLearner:
                     reverted = False
                     self.positives += 1
                     self.update_stats(candidate, delta)
-                    msg = (
-                        f"[meta] ep {episode:03d}: (action={candidate}, Δ={delta:.3f}, "
-                        f"reverted={reverted}, pos_ratio={self.positive_ratio():.2f})"
-                    )
+                    msg = self._build_message(episode, candidate, delta, reverted, info)
                     self.logger.info(msg)
                     return agent, msg
             self.update_stats(candidate, delta)
-            msg = (
-                f"[meta] ep {episode:03d}: (action={candidate}, Δ={delta:.3f}, "
-                f"reverted={reverted}, pos_ratio={self.positive_ratio():.2f})"
-            )
+            msg = self._build_message(episode, candidate, delta, reverted, info)
             messages.append(msg)
             self.logger.info(msg)
         # 所有尝试均未带来正向收益，返回最后一次回滚后的 agent。
         return agent, messages[-1]
+
+    def _build_message(
+        self,
+        episode: int,
+        candidate: str,
+        delta: float,
+        reverted: bool,
+        info: str | None,
+    ) -> str:
+        base = (
+            f"[meta] ep {episode:03d}: (action={candidate}, Δ={delta:.3f}, "
+            f"reverted={reverted}, pos_ratio={self.positive_ratio():.2f}"
+        )
+        if info:
+            base += f", {info}"
+        return base + ")"
 
 
 def run_training(episodes: int = 240) -> None:
