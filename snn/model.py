@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import copy
-import logging
 import math
 import random
 import time
 from typing import List, Sequence, Tuple
 
+from tools.logger import get_logger
+
 from .dense import DenseLIF
 from .lif import LIFParams, fast_sigmoid_surrogate, triangular_surrogate
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def softmax(logits: Sequence[float]) -> List[float]:
