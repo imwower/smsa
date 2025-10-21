@@ -1,8 +1,9 @@
-"""Minimal SNN model and training utilities for XOR."""
+"""最小化 XOR 任务的脉冲网络模型与训练工具。"""
 
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import random
 import time
@@ -10,6 +11,9 @@ from typing import List, Sequence, Tuple
 
 from .dense import DenseLIF
 from .lif import LIFParams, fast_sigmoid_surrogate, triangular_surrogate
+
+
+logger = logging.getLogger(__name__)
 
 
 def softmax(logits: Sequence[float]) -> List[float]:
@@ -49,7 +53,7 @@ def clip_value(value: float, limit: float) -> float:
 
 
 class SNNModel:
-    """Hidden DenseLIF population with linear readout for XOR."""
+    """使用隐藏 LIF 层与线性读出的 XOR 网络。"""
 
     def __init__(
         self,
@@ -234,11 +238,13 @@ def train_xor(
             trials_per_example=eval_replays,
         )
         avg_loss = epoch_loss / float(max(epoch_trials, 1))
-        print(
-            f"epoch {epoch:02d} "
-            f"train_acc {epoch_hits / float(max(epoch_trials, 1)):.3f} "
-            f"eval_acc {eval_acc:.3f} "
-            f"loss {avg_loss:.3f}"
+        train_acc = epoch_hits / float(max(epoch_trials, 1))
+        logger.info(
+            "第%02d轮 训练准确率 %.3f 验证准确率 %.3f 平均损失 %.3f",
+            epoch,
+            train_acc,
+            eval_acc,
+            avg_loss,
         )
         if eval_acc >= 0.9 and epoch >= 20:
             break
@@ -250,6 +256,6 @@ def train_xor(
         low_rate=low_rate,
         trials_per_example=eval_replays,
     )
-    print(f"training_time {duration:.2f}s")
-    print(f"Final evaluation accuracy: {final_acc:.3f}")
+    logger.info("训练耗时 %.2f 秒", duration)
+    logger.info("最终评估准确率 %.3f", final_acc)
     return final_acc

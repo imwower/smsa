@@ -1,5 +1,5 @@
-"""Placeholder for meta-control and auto-adaptation utilities."""
+"""元控制与自适应工具占位符。"""
 
 
 def not_implemented() -> None:
-    raise NotImplementedError("Meta auto-adaptation is not yet implemented.")
+    raise NotImplementedError("自适应元控制尚未实现。")

@@ -1,4 +1,4 @@
-"""Dense layer of LIF neurons with eligibility traces for e-prop."""
+"""带资格迹的 LIF 稠密层（e-prop 三因子）。"""
 
 from typing import Callable, List, Sequence, Tuple
 import math
@@ -8,7 +8,7 @@ from .lif import LIFParams, SurrogateFn
 
 
 class DenseLIF:
-    """Dense LIF population maintaining per-synapse eligibility traces."""
+    """维护逐突触资格迹的 LIF 稠密群体。"""
 
     def __init__(
         self,

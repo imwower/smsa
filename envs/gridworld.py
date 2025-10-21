@@ -1,5 +1,5 @@
-"""Placeholder for GridWorld environment implementation."""
+"""GridWorld 环境实现占位符。"""
 
 
 def not_implemented() -> None:
-    raise NotImplementedError("GridWorld environment is not yet implemented.")
+    raise NotImplementedError("GridWorld 环境尚未实现。")

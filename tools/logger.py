@@ -1,5 +1,5 @@
-"""Placeholder for logging utilities."""
+"""日志工具占位符。"""
 
 
 def not_implemented() -> None:
-    raise NotImplementedError("Logger utilities are not yet implemented.")
+    raise NotImplementedError("日志工具尚未实现。")

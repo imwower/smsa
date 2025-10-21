@@ -1,7 +1,8 @@
-"""CLI entry point for training the XOR SNN prototype."""
+"""XOR 脉冲网络训练脚本入口。"""
 
 from __future__ import annotations
 
+import logging
 import pathlib
 import sys
 
@@ -14,8 +15,12 @@ from snn.model import train_xor
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
     final_acc = train_xor()
-    assert final_acc >= 0.9, "XOR accuracy target not met."
+    assert final_acc >= 0.9, "XOR 准确率未达到 0.9 的目标。"
 
 
 if __name__ == "__main__":

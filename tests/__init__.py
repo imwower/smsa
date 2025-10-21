@@ -1,1 +1,1 @@
-"""Test suite package placeholder."""
+"""测试套件占位符。"""

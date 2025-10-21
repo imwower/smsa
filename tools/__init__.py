@@ -1,1 +1,1 @@
-"""Shared tooling and logging helpers placeholder."""
+"""通用工具与日志模块占位符。"""

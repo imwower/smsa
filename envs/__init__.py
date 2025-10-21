@@ -1,1 +1,1 @@
-"""Environment stubs for SMSA experiments."""
+"""SMSA 环境模块占位符。"""
