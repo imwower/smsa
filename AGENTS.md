@@ -1,20 +1,20 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-SMSA organizes agent logic by lifecycle stage. Core spikes and network primitives live in `snn/` (`lif.py`, `dense.py`, `policy.py`, `selfmodel.py`). Experiment harnesses and CLI entry points sit under `scripts/`, while lightweight GridWorld environments reside in `envs/`. Meta-control and auto-adaptation helpers are in `meta/autoadapt.py`. Shared logging utilities are in `tools/logger.py`. Tests mirror the module layout inside `tests/` (e.g., `test_lif.py`, `test_meta.py`). Standalone prototypes (`snn_py_evo.py`, `snn_py_explore_auto.py`, `snn_self_agent.py`) provide compact baselines; keep them in sync with the modular folders when changing behavior.
+Core spiking-neuron modules live in `snn/`: `lif.py` for neuron dynamics, `dense.py` for synaptic layers, `policy.py` for decision heads, and `selfmodel.py` for self-prediction. Experiments and training entry points sit in `scripts/` (e.g., `scripts/train_gridworld.py`), while light-weight GridWorld environments are in `envs/`. Meta-control helpers reside in `meta/autoadapt.py`, and shared logging utilities are under `tools/logger.py`. Tests mirror this layout inside `tests/` (`tests/test_lif.py`, `tests/test_meta.py`). Standalone baselines (`snn_py_evo.py`, `snn_py_explore_auto.py`, `snn_self_agent.py`) should stay behaviorally aligned with the modular code.
 
 ## Build, Test, and Development Commands
-- `python snn_py_evo.py` — quick XOR sanity check; expected ≥0.9 accuracy within ~30 epochs.
-- `python scripts/train_gridworld.py --episodes 80 --seed 0 ...` — staged GridWorld exploration with tunable intrinsic rewards.
-- `python snn_self_agent.py` — full self-model pipeline with meta-adaptation; monitor `[meta]` logs.
-- `python -m unittest discover tests` — run all regression tests; prefer deterministic seeds via `--seed`.
-- `python scripts/eval_metrics.py --run runs/exp_001` — recompute CSV analytics for a training run.
+- `python snn_py_evo.py` — run the XOR smoke test; expect ≥0.9 accuracy within ~30 epochs.
+- `python scripts/train_gridworld.py --episodes 80 --seed 0` — launch the staged GridWorld exploration loop; adjust intrinsic reward flags as needed.
+- `python snn_self_agent.py` — execute the full self-model pipeline and watch `[meta]` logs for adaptation checkpoints.
+- `python -m unittest discover tests` — execute the regression suite; add `--seed <int>` for deterministic runs.
+- `python scripts/eval_metrics.py --run runs/exp_001` — regenerate CSV analytics for a completed training run.
 
 ## Coding Style & Naming Conventions
-Stick to Python 3.10+ standard-library only. Use 4-space indentation, `snake_case` for functions, `CapWords` for classes, and prefix auxiliary experiments with `experiment_`. Document public functions with concise PEP 257 docstrings; add inline comments only for non-obvious math (e.g., surrogate gradients). Keep configuration constants grouped near the top of each module and expose them via dataclasses when adding new knobs.
+Target Python 3.10+, 4-space indentation, and standard-library dependencies only. Use `snake_case` for functions and module-level helpers, `CapWords` for classes, and prefix exploratory scripts with `experiment_`. Group configuration constants near the top of each module and expose new tunables via `@dataclass` containers. Inline comments should clarify only non-obvious math (e.g., surrogate gradients).
 
 ## Testing Guidelines
-Add targeted unit tests mirroring the module name (e.g., `test_policy.py`). Favor pure functions over side effects so eligibility traces remain testable. When introducing stochasticity, gate it behind seeded RNG objects and assert on statistical envelopes (mean spikes, reward deltas). Update `tests/` whenever meta-parameters change defaults and include failure-mode coverage for self-modification rollbacks.
+Write unit tests alongside modules in `tests/`, mirroring filenames (`tests/test_policy.py` for `snn/policy.py`). Favor pure functions so eligibility traces can be asserted. Gate stochastic logic behind seeded RNG objects and assert on statistical envelopes (mean spike counts, reward deltas). Whenever defaults change, update the relevant tests and cover rollback paths for adaptive policies.
 
 ## Commit & Pull Request Guidelines
-Write imperative, component-scoped commits (`snn: tune pseudo_gradient`). Include motivation and expected metrics deltas in the extended description. Pull requests should summarize scenario, list modified scripts/configs, attach relevant ASCII log excerpts, and note rollback safeguards. Link tracking issues when touching adaptive policies, and add checklist items for rerun commands and generated artifacts paths.
+Craft imperative, component-scoped commits such as `snn: tune pseudo_gradient`, and include motivation plus expected metric deltas in the extended description. Pull requests should summarize the scenario, list adjusted scripts/configs, attach ASCII log excerpts, and note rollback safeguards. Link tracking issues when touching adaptive policies, and provide a checklist for rerun commands and generated artifact paths before requesting review.
