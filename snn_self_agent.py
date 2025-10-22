@@ -13,6 +13,7 @@ from typing import Dict, List, Sequence, Tuple
 
 from snn.dense import DenseLIF, LinearTemporalUnit
 from snn.lif import LIFParams, fast_sigmoid_surrogate
+from snn.selfmodel import SelfModel
 from tools.logger import get_logger, setup_logging
 
 
@@ -306,181 +307,6 @@ class SNNPolicy:
     def begin_episode(self) -> None:
         if self.temporal_unit is not None:
             self.temporal_unit.reset()
-
-
-@dataclass
-class SelfModelState:
-    probs_next: List[float]
-    probs_cause: List[float]
-    pred_reward: float
-    pred_energy: float
-    eligibility_history: List[List[List[float]]]
-    bias_history: List[List[float]]
-    hidden_rates: List[float]
-    hidden_counts: List[int]
-    energy_norm: float
-
-
-class SelfModel:
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        params: LIFParams,
-        inner_steps: int = 16,
-        hidden_lr: float = 0.12,
-        readout_lr: float = 0.2,
-        clip: float = 2.0,
-    ) -> None:
-        self.hidden = DenseLIF(
-            n_in=input_size,
-            n_out=hidden_size,
-            params=params,
-            surrogate_fn=fast_sigmoid_surrogate,
-        )
-        self.inner_steps = inner_steps
-        self.hidden_lr = hidden_lr
-        self.readout_lr = readout_lr
-        self.clip = clip
-        self.next_obs_dim = 25
-        self.cause_dim = 2
-        self.next_weights = [
-            [random.uniform(-0.15, 0.15) for _ in range(self.next_obs_dim)]
-            for _ in range(hidden_size)
-        ]
-        self.next_bias = [0.0 for _ in range(self.next_obs_dim)]
-        self.reward_weights = [random.uniform(-0.1, 0.1) for _ in range(hidden_size)]
-        self.reward_bias = 0.0
-        self.energy_weights = [random.uniform(-0.1, 0.1) for _ in range(hidden_size)]
-        self.energy_bias = 0.0
-        self.cause_weights = [
-            [random.uniform(-0.15, 0.15) for _ in range(self.cause_dim)]
-            for _ in range(hidden_size)
-        ]
-        self.cause_bias = [0.0 for _ in range(self.cause_dim)]
-        self.obs_weight = 1.2
-        self.reward_weight = 0.35
-        self.energy_weight = 0.35
-        self.cause_weight = 0.5
-
-    def forward(self, rates: Sequence[float]) -> SelfModelState:
-        self.hidden.reset_state()
-        hidden_counts = [0 for _ in range(self.hidden.n_out)]
-        eligibility_history: List[List[List[float]]] = []
-        bias_history: List[List[float]] = []
-        for _ in range(self.inner_steps):
-            pre_spikes = [spike_from_rate(rate) for rate in rates]
-            spikes, _, eligibility_snapshot, bias_snapshot = self.hidden.step(
-                pre_spikes
-            )
-            hidden_counts = [c + s for c, s in zip(hidden_counts, spikes)]
-            eligibility_history.append([row[:] for row in eligibility_snapshot])
-            bias_history.append(bias_snapshot[:])
-        hidden_rates = [count / float(self.inner_steps) for count in hidden_counts]
-        logits_next = []
-        for idx in range(self.next_obs_dim):
-            logit = self.next_bias[idx]
-            for h in range(self.hidden.n_out):
-                logit += self.next_weights[h][idx] * hidden_rates[h]
-            logits_next.append(logit)
-        probs_next = softmax(logits_next)
-        pred_reward = self.reward_bias
-        for h in range(self.hidden.n_out):
-            pred_reward += self.reward_weights[h] * hidden_rates[h]
-        pred_energy = self.energy_bias
-        for h in range(self.hidden.n_out):
-            pred_energy += self.energy_weights[h] * hidden_rates[h]
-        logits_cause = []
-        for idx in range(self.cause_dim):
-            logit = self.cause_bias[idx]
-            for h in range(self.hidden.n_out):
-                logit += self.cause_weights[h][idx] * hidden_rates[h]
-            logits_cause.append(logit)
-        probs_cause = softmax(logits_cause)
-        energy_norm = sum(hidden_counts) / float(
-            max(1, self.inner_steps * self.hidden.n_out)
-        )
-        return SelfModelState(
-            probs_next=probs_next,
-            probs_cause=probs_cause,
-            pred_reward=pred_reward,
-            pred_energy=pred_energy,
-            eligibility_history=eligibility_history,
-            bias_history=bias_history,
-            hidden_rates=hidden_rates,
-            hidden_counts=hidden_counts,
-            energy_norm=energy_norm,
-        )
-
-    def update(
-        self,
-        state: SelfModelState,
-        next_obs_index: int,
-        reward_target: float,
-        energy_target: float,
-        cause_label: int,
-    ) -> None:
-        target_next = [0.0 for _ in range(self.next_obs_dim)]
-        target_next[next_obs_index] = 1.0
-        obs_errors = [
-            self.obs_weight * (state.probs_next[idx] - target_next[idx])
-            for idx in range(self.next_obs_dim)
-        ]
-        reward_error = self.reward_weight * (state.pred_reward - reward_target)
-        energy_error = self.energy_weight * (state.pred_energy - energy_target)
-        target_cause = [0.0, 0.0]
-        target_cause[cause_label] = 1.0
-        cause_errors = [
-            self.cause_weight * (state.probs_cause[idx] - target_cause[idx])
-            for idx in range(self.cause_dim)
-        ]
-        learning_signals = []
-        for h in range(self.hidden.n_out):
-            signal = 0.0
-            for idx in range(self.next_obs_dim):
-                signal += obs_errors[idx] * self.next_weights[h][idx]
-            signal += reward_error * self.reward_weights[h]
-            signal += energy_error * self.energy_weights[h]
-            for idx in range(self.cause_dim):
-                signal += cause_errors[idx] * self.cause_weights[h][idx]
-            learning_signals.append(clip_value(signal, self.clip))
-        for i in range(self.hidden.n_in):
-            for h in range(self.hidden.n_out):
-                grad = 0.0
-                for elig in state.eligibility_history:
-                    grad += learning_signals[h] * elig[i][h]
-                grad = clip_value(grad, self.clip)
-                self.hidden.weights[i][h] -= self.hidden_lr * grad
-        for h in range(self.hidden.n_out):
-            grad = 0.0
-            for bias_elig in state.bias_history:
-                grad += learning_signals[h] * bias_elig[h]
-            grad = clip_value(grad, self.clip)
-            self.hidden.bias[h] -= self.hidden_lr * grad
-        for h in range(self.hidden.n_out):
-            for idx in range(self.next_obs_dim):
-                grad = clip_value(obs_errors[idx] * state.hidden_rates[h], self.clip)
-                self.next_weights[h][idx] -= self.readout_lr * grad
-        for idx in range(self.next_obs_dim):
-            grad = clip_value(obs_errors[idx], self.clip)
-            self.next_bias[idx] -= self.readout_lr * grad
-        for h in range(self.hidden.n_out):
-            grad = clip_value(reward_error * state.hidden_rates[h], self.clip)
-            self.reward_weights[h] -= self.readout_lr * grad
-        self.reward_bias -= self.readout_lr * clip_value(reward_error, self.clip)
-        for h in range(self.hidden.n_out):
-            grad = clip_value(energy_error * state.hidden_rates[h], self.clip)
-            self.energy_weights[h] -= self.readout_lr * grad
-        self.energy_bias -= self.readout_lr * clip_value(energy_error, self.clip)
-        for h in range(self.hidden.n_out):
-            for idx in range(self.cause_dim):
-                grad = clip_value(cause_errors[idx] * state.hidden_rates[h], self.clip)
-                self.cause_weights[h][idx] -= self.readout_lr * grad
-        for idx in range(self.cause_dim):
-            grad = clip_value(cause_errors[idx], self.clip)
-            self.cause_bias[idx] -= self.readout_lr * grad
-
-
 def build_self_model_input(
     state_index: int,
     action: int,
@@ -658,7 +484,7 @@ def estimate_success_rate(
     return successes / float(max(episodes, 1))
 
 
-def run_training(episodes: int = 140) -> None:
+def run_training(episodes: int = 200) -> None:
     setup_logging()
     logger = get_logger(__name__)
     random.seed(42)
@@ -672,9 +498,10 @@ def run_training(episodes: int = 140) -> None:
     )
     self_params = LIFParams(v_th=0.5, tau_m=10.0, tau_a=20.0, beta=0.35, refractory=2)
     self_model = SelfModel(
-        input_size=env.cfg.size * env.cfg.size + 4 + 4,
+        obs_dim=env.cfg.size * env.cfg.size,
+        action_dim=4,
         hidden_size=28,
-        params=self_params,
+        lif_params=self_params,
     )
     buffer = ReplayBuffer(capacity=3000)
 
@@ -841,9 +668,10 @@ def run_training(episodes: int = 140) -> None:
             buffer_snapshot.data.extend(buffer.data)
             baseline_agent = copy.deepcopy(policy)
             baseline_self_model = SelfModel(
-                input_size=self_model.hidden.n_in,
+                obs_dim=env.cfg.size * env.cfg.size,
+                action_dim=4,
                 hidden_size=self_model.hidden.n_out,
-                params=LIFParams(
+                lif_params=LIFParams(
                     v_th=self_model.hidden.params.v_th,
                     tau_m=self_model.hidden.params.tau_m,
                     tau_a=self_model.hidden.params.tau_a,
