@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
 from meta.autoadapt import CodePatcher, MetaLearner
-from snn.dense import DenseLIF
+from snn.dense import DenseLIF, LinearTemporalUnit
 from snn.lif import LIFParams, fast_sigmoid_surrogate, triangular_surrogate
 from snn.selfmodel import SelfModel
 from tools.logger import get_logger, setup_logging
@@ -134,9 +134,11 @@ class SNNAgent:
         readout_lr: float = 0.3,
         clip: float = 2.0,
         intrinsic_beta: float = 0.3,
+        temporal_state_size: int | None = None,
+        temporal_beta: float = 0.85,
     ) -> None:
         self.hidden = DenseLIF(
-            n_in=state_size,
+            n_in=state_size + (temporal_state_size or state_size),
             n_out=hidden_size,
             params=params,
             surrogate_fn=fast_sigmoid_surrogate,
@@ -160,6 +162,12 @@ class SNNAgent:
         self.patched = False
         self.code_patcher = CodePatcher()
         self.last_patch_info: str | None = None
+        self.temporal_state_size = temporal_state_size or state_size
+        self.temporal_unit = LinearTemporalUnit(
+            n_in=state_size,
+            n_state=self.temporal_state_size,
+            beta=temporal_beta,
+        )
 
     def intrinsic_bonus(self, visit_count: int) -> float:
         return self.intrinsic_beta / math.sqrt(visit_count + 1)
@@ -169,6 +177,9 @@ class SNNAgent:
         vec[index] = 1
         return vec
 
+    def begin_episode(self) -> None:
+        self.temporal_unit.reset()
+
     def forward(self, state_index: int) -> PolicyState:
         bits = self.encode_state(state_index)
         self.hidden.reset_state()
@@ -176,10 +187,15 @@ class SNNAgent:
         eligibility_history: List[List[List[float]]] = []
         bias_history: List[List[float]] = []
         for _ in range(self.inner_steps):
-            pre_spikes = [
-                spike_from_rate(self.high_rate if bit else self.low_rate)
-                for bit in bits
+            base_rates = [
+                self.high_rate if bit else self.low_rate for bit in bits
             ]
+            temporal_state = self.temporal_unit.transform(
+                [float(bit) for bit in bits]
+            )
+            temporal_rates = [max(0.0, min(rate, 1.0)) for rate in temporal_state]
+            combined_rates = base_rates + temporal_rates
+            pre_spikes = [spike_from_rate(rate) for rate in combined_rates]
             spikes, _, eligibility_snapshot, bias_snapshot = self.hidden.step(
                 pre_spikes
             )
@@ -393,6 +409,7 @@ def evaluate_agent(
         visit_counts: Dict[int, int] = defaultdict(int)
         pos = env.reset()
         idx = env.state_index(pos)
+        agent.begin_episode()
         steps = 0
         while steps < env.cfg.max_steps:
             pol_state = agent.forward(idx)
@@ -444,6 +461,7 @@ def run_training(episodes: int = 240) -> None:
 
     for episode in range(1, episodes + 1):
         state = env.reset()
+        agent.begin_episode()
         state_index = env.state_index(state)
         episode_reward = 0.0
         reached_goal = 0
