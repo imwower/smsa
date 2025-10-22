@@ -9,6 +9,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
+from meta.autoadapt import MetaLearner
 from snn.dense import DenseLIF
 from snn.lif import LIFParams, fast_sigmoid_surrogate, triangular_surrogate
 from tools.logger import get_logger, setup_logging
@@ -317,6 +318,14 @@ class SNNAgent:
         return True
 
     def apply_modification(self, action: str) -> Tuple[bool, str | None]:
+        translations = {
+            "inner_up": "inner_steps_up",
+            "inner_down": "inner_steps_down",
+            "patch_surrogate": "code_patch_surrogate",
+            "vth_up": "v_th_up",
+            "vth_down": "v_th_down",
+        }
+        action = translations.get(action, action)
         info: str | None = None
         if action == "eta_up":
             self.hidden_lr = min(self.hidden_lr * 1.2, 0.6)
@@ -398,136 +407,6 @@ def evaluate_agent(
     return total_reward / float(max(episodes, 1))
 
 
-class MetaLearner:
-    def __init__(self, window: int = 20, min_delta: float = 0.05) -> None:
-        self.window = window
-        self.min_delta = min_delta
-        self.candidates = [
-            "eta_up",
-            "eta_down",
-            "v_th_up",
-            "v_th_down",
-            "intrinsic_up",
-            "intrinsic_down",
-            "inner_steps_up",
-            "inner_steps_down",
-            "add_neuron",
-            "prune_neuron",
-            "switch_surrogate",
-            "code_patch_surrogate",
-        ]
-        self.counts = {c: 0 for c in self.candidates}
-        self.totals = {c: 0.0 for c in self.candidates}
-        self.total_attempts = 0
-        self.positives = 0
-        self.ucb_c = 0.4
-        self.logger = get_logger(__name__ + ".meta")
-
-    def should_trigger(self, history: Sequence[float]) -> bool:
-        if len(history) < self.window:
-            return False
-        window = history[-self.window :]
-        return (max(window) - min(window)) < self.min_delta
-
-    def select_candidate(self) -> str:
-        total_counts = sum(max(1, self.counts[c]) for c in self.candidates)
-        best_score = -float("inf")
-        best_candidate = self.candidates[0]
-        for cand in self.candidates:
-            mean = (
-                self.totals[cand] / self.counts[cand]
-                if self.counts[cand] > 0
-                else 0.05
-            )
-            bonus = math.sqrt(
-                2.0 * math.log(max(total_counts, 2)) / max(self.counts[cand], 1)
-            )
-            score = mean + self.ucb_c * bonus
-            if (
-                score > best_score + 1e-9
-                or (abs(score - best_score) <= 1e-9 and random.random() < 0.5)
-            ):
-                best_score = score
-                best_candidate = cand
-        return best_candidate
-
-    def update_stats(self, candidate: str, delta: float) -> None:
-        self.counts[candidate] += 1
-        self.totals[candidate] += delta
-
-    def positive_ratio(self) -> float:
-        if self.total_attempts == 0:
-            return 1.0
-        return self.positives / float(self.total_attempts)
-
-    def adapt(
-        self,
-        agent: SNNAgent,
-        env_cfg: GridWorldConfig,
-        episode: int,
-        history: Sequence[float],
-    ) -> Tuple[SNNAgent, str]:
-        baseline_seed = 1000 + episode * 7
-        before = evaluate_agent(copy.deepcopy(agent), env_cfg, episodes=5, seed=baseline_seed)
-        messages: List[str] = []
-        tried = []
-        candidates = [self.select_candidate(), "eta_up"]
-        for idx, candidate in enumerate(candidates):
-            self.total_attempts += 1
-            tried.append(candidate)
-            backup = copy.deepcopy(agent)
-            applied, info = agent.apply_modification(candidate)
-            if not applied:
-                delta = -0.01
-                reverted = True
-                agent = backup
-            else:
-                after = evaluate_agent(copy.deepcopy(agent), env_cfg, episodes=5, seed=baseline_seed)
-                raw_delta = after - before
-                if raw_delta < 0.0:
-                    if candidate == "eta_up":
-                        delta = 0.02
-                        reverted = False
-                        self.positives += 1
-                        self.update_stats(candidate, delta)
-                        msg = self._build_message(episode, candidate, delta, reverted, info)
-                        self.logger.info(msg)
-                        return agent, msg
-                    agent = backup
-                    delta = raw_delta
-                    reverted = True
-                else:
-                    delta = raw_delta + 0.02
-                    reverted = False
-                    self.positives += 1
-                    self.update_stats(candidate, delta)
-                    msg = self._build_message(episode, candidate, delta, reverted, info)
-                    self.logger.info(msg)
-                    return agent, msg
-            self.update_stats(candidate, delta)
-            msg = self._build_message(episode, candidate, delta, reverted, info)
-            messages.append(msg)
-            self.logger.info(msg)
-        # 所有尝试均未带来正向收益，返回最后一次回滚后的 agent。
-        return agent, messages[-1]
-
-    def _build_message(
-        self,
-        episode: int,
-        candidate: str,
-        delta: float,
-        reverted: bool,
-        info: str | None,
-    ) -> str:
-        base = (
-            f"[meta] ep {episode:03d}: (action={candidate}, Δ={delta:.3f}, "
-            f"reverted={reverted}, pos_ratio={self.positive_ratio():.2f}"
-        )
-        if info:
-            base += f", {info}"
-        return base + ")"
-
-
 def run_training(episodes: int = 240) -> None:
     setup_logging()
     logger = get_logger(__name__)
@@ -584,8 +463,21 @@ def run_training(episodes: int = 240) -> None:
         )
         return_history.append(running_return)
         if meta.should_trigger(list(return_history)):
-            agent, meta_msg = meta.adapt(agent, env_cfg, episode, list(return_history))
-            logger.info(meta_msg)
+            def evaluate_for_meta(candidate_agent: SNNAgent, seed: int) -> float:
+                return evaluate_agent(
+                    candidate_agent,
+                    env_cfg,
+                    episodes=meta.ab_episodes,
+                    seed=seed,
+                )
+
+            agent, meta_messages = meta.adapt(
+                agent,
+                step=episode,
+                evaluate_fn=evaluate_for_meta,
+            )
+            for meta_msg in meta_messages:
+                logger.info(meta_msg)
             return_history.clear()
 
     overall_success = sum(success_history[-60:]) / float(min(60, len(success_history)))
