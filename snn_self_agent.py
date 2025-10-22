@@ -255,7 +255,16 @@ class SNNPolicy:
     def intrinsic_bonus(self, visit_count: int) -> float:
         return self.intrinsic_beta / math.sqrt(visit_count + 1)
 
-    def update(self, state: PolicyState, action: int, advantage: float) -> None:
+    def update(
+        self,
+        state: PolicyState,
+        action: int,
+        advantage: float,
+        *,
+        self_signal: Sequence[float] | None = None,
+        alpha: float = 1.0,
+        beta: float = 0.0,
+    ) -> None:
         policy_error = [p for p in state.probs]
         policy_error[action] -= 1.0
         policy_error = [
@@ -267,6 +276,20 @@ class SNNPolicy:
             for a in range(4):
                 signal += policy_error[a] * self.readout_weights[h][a]
             learning_signals.append(clip_value(signal, self.clip))
+        if self_signal is not None:
+            if len(self_signal) != self.hidden.n_out:
+                adjusted = [0.0 for _ in range(self.hidden.n_out)]
+                limit = min(len(self_signal), self.hidden.n_out)
+                for h in range(limit):
+                    adjusted[h] = self_signal[h]
+                self_signal = adjusted
+            combined = []
+            for h in range(self.hidden.n_out):
+                combined_signal = alpha * learning_signals[h] + beta * self_signal[h]
+                combined.append(clip_value(combined_signal, self.clip))
+            learning_signals = combined
+        else:
+            learning_signals = [clip_value(alpha * sig, self.clip) for sig in learning_signals]
         for i in range(self.hidden.n_in):
             for h in range(self.hidden.n_out):
                 grad = 0.0
@@ -393,6 +416,26 @@ def simulate_recovery(
     dream_sequences: int = 3,
 ) -> int:
     success_window: deque[int] = deque(maxlen=30)
+    policy_alpha = 1.0
+    policy_beta = 0.4
+    meta_effect_span = 12
+    meta_recent_steps = 0
+
+    policy_alpha = 1.0
+    policy_beta = 0.4
+    meta_effect_span = 12
+    meta_recent_steps = 0
+
+    policy_alpha = 1.0
+    policy_beta = 0.4
+    meta_effect_span = 12
+    meta_recent_steps = 0
+
+    policy_alpha = 1.0
+    policy_beta = 0.4
+    meta_effect_span = 12
+    meta_recent_steps = 0
+
     visit_counts: Dict[int, int] = defaultdict(int)
     for episode in range(1, max_episodes + 1):
         env = GridWorld(env_cfg)
@@ -521,6 +564,11 @@ def run_training(episodes: int = 200) -> None:
         )
         writer.writeheader()
 
+    policy_alpha = 1.0
+    policy_beta = 0.4
+    meta_effect_span = 12
+    meta_recent_steps = 0
+
     visit_counts: Dict[int, int] = defaultdict(int)
     episode_records: List[Tuple[float, float]] = []
     nll_history: List[float] = []
@@ -566,22 +614,31 @@ def run_training(episodes: int = 200) -> None:
             reward = base_reward + bonus
             episode_reward += reward
             advantage = reward - policy.baseline
-            policy.update(policy_state, action, advantage)
-            policy.update_baseline(reward)
             next_index = env.state_index(next_state)
-
             energy_target = min(
                 sum(policy_state.hidden_counts)
                 / float(policy.inner_steps * policy.hidden.n_out),
                 1.0,
             )
-            self_model.update(
+            cause_label = 1 if caused_by_self else 0
+            self_signal = self_model.update(
                 state=self_state,
                 next_obs_index=next_index,
                 reward_target=reward,
                 energy_target=energy_target,
-                cause_label=1 if caused_by_self else 0,
+                cause_label=cause_label,
             )
+            policy.update(
+                policy_state,
+                action,
+                advantage,
+                self_signal=self_signal,
+                alpha=policy_alpha,
+                beta=policy_beta,
+            )
+            policy.update_baseline(reward)
+            if meta_recent_steps > 0:
+                meta_recent_steps -= 1
             buffer.add(
                 state_index,
                 action,
@@ -593,8 +650,10 @@ def run_training(episodes: int = 200) -> None:
             nll = -math.log(max(self_state.probs_next[next_index], 1e-8))
             reward_mse = (self_state.pred_reward - reward) ** 2
             energy_mse = (self_state.pred_energy - energy_target) ** 2
-            cause_pred = 1 if self_state.probs_cause[1] >= self_state.probs_cause[0] else 0
-            cause_hit = 1 if cause_pred == (1 if caused_by_self else 0) else 0
+            cause_pred = (
+                1 if self_state.probs_cause[1] >= self_state.probs_cause[0] else 0
+            )
+            cause_hit = 1 if cause_pred == cause_label else 0
 
             episode_nll += nll
             episode_reward_mse += reward_mse

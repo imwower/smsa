@@ -12,6 +12,7 @@ from typing import Dict, List, Sequence, Tuple
 from meta.autoadapt import MetaLearner
 from snn.dense import DenseLIF
 from snn.lif import LIFParams, fast_sigmoid_surrogate, triangular_surrogate
+from snn.selfmodel import SelfModel
 from tools.logger import get_logger, setup_logging
 import ast
 
@@ -136,6 +137,28 @@ def clip_value(value: float, limit: float) -> float:
     return value
 
 
+def build_self_model_input(
+    state_index: int,
+    action: int,
+    mean_rate: float,
+    sum_rate: float,
+    eta_e: float,
+    v_th: float,
+    state_size: int,
+) -> List[float]:
+    obs_vec = [0.0 for _ in range(state_size)]
+    obs_vec[state_index] = 1.0
+    action_vec = [0.0 for _ in range(4)]
+    action_vec[action] = 1.0
+    extras = [
+        max(0.0, min(mean_rate, 1.0)),
+        max(0.0, min(sum_rate, 1.0)),
+        max(0.0, min(eta_e, 1.0)),
+        max(0.0, min(v_th, 1.0)),
+    ]
+    return obs_vec + action_vec + extras
+
+
 @dataclass
 class PolicyState:
     probs: List[float]
@@ -248,7 +271,16 @@ class SNNAgent:
             + self.baseline_beta * reward
         )
 
-    def update(self, state: PolicyState, action: int, advantage: float) -> None:
+    def update(
+        self,
+        state: PolicyState,
+        action: int,
+        advantage: float,
+        *,
+        self_signal: Sequence[float] | None = None,
+        alpha: float = 1.0,
+        beta: float = 0.0,
+    ) -> None:
         policy_error = [p for p in state.probs]
         policy_error[action] -= 1.0
         policy_error = [
@@ -260,6 +292,20 @@ class SNNAgent:
             for a in range(4):
                 signal += policy_error[a] * self.readout_weights[h][a]
             learning_signals.append(clip_value(signal, self.clip))
+        if self_signal is not None:
+            if len(self_signal) != self.hidden.n_out:
+                adjusted = [0.0 for _ in range(self.hidden.n_out)]
+                limit = min(len(self_signal), self.hidden.n_out)
+                for h in range(limit):
+                    adjusted[h] = self_signal[h]
+                self_signal = adjusted
+            combined = []
+            for h in range(self.hidden.n_out):
+                combined_signal = alpha * learning_signals[h] + beta * self_signal[h]
+                combined.append(clip_value(combined_signal, self.clip))
+            learning_signals = combined
+        else:
+            learning_signals = [clip_value(alpha * sig, self.clip) for sig in learning_signals]
         for i in range(self.hidden.n_in):
             for h in range(self.hidden.n_out):
                 grad = 0.0
@@ -419,30 +465,94 @@ def run_training(episodes: int = 240) -> None:
         hidden_size=24,
         params=params,
     )
+    self_params = LIFParams(v_th=0.5, tau_m=10.0, tau_a=20.0, beta=0.35, refractory=2)
+    self_model = SelfModel(
+        obs_dim=env_cfg.size * env_cfg.size,
+        action_dim=4,
+        hidden_size=24,
+        lif_params=self_params,
+    )
     visit_counts: Dict[int, int] = defaultdict(int)
     meta = MetaLearner(window=20, min_delta=0.05)
     return_history: deque[float] = deque(maxlen=meta.window)
     running_return: float | None = None
     success_history: List[int] = []
+    nll_history: List[float] = []
+    cause_history: List[float] = []
+    energy_history: List[float] = []
+    policy_alpha = 1.0
+    policy_beta = 0.4
+    meta_effect_span = 12
+    meta_recent_steps = 0
 
     for episode in range(1, episodes + 1):
         state = env.reset()
         state_index = env.state_index(state)
         episode_reward = 0.0
         reached_goal = 0
-        for _ in range(env.cfg.max_steps):
+        episode_nll = 0.0
+        episode_cause_hits = 0
+        episode_energy_mse = 0.0
+        steps = 0
+        while steps < env.cfg.max_steps:
             policy_state = agent.forward(state_index)
             action = agent.sample_action(policy_state.probs)
             bonus = agent.intrinsic_bonus(visit_counts[state_index])
             visit_counts[state_index] += 1
+            features = build_self_model_input(
+                state_index=state_index,
+                action=action,
+                mean_rate=policy_state.mean_rate,
+                sum_rate=policy_state.sum_rate,
+                eta_e=agent.hidden_lr,
+                v_th=agent.hidden.params.v_th,
+                state_size=env_cfg.size * env_cfg.size,
+            )
+            self_state = self_model.forward(features)
+
             next_state, base_reward, done = env.step(action)
             reward = base_reward + bonus
             episode_reward += reward
             advantage = reward - agent.baseline
-            agent.update(policy_state, action, advantage)
+            next_index = env.state_index(next_state)
+
+            energy_target = min(
+                sum(policy_state.hidden_counts)
+                / float(agent.inner_steps * agent.hidden.n_out),
+                1.0,
+            )
+            cause_label = 1 if meta_recent_steps > 0 else 0
+            self_signal = self_model.update(
+                state=self_state,
+                next_obs_index=next_index,
+                reward_target=reward,
+                energy_target=energy_target,
+                cause_label=cause_label,
+            )
+            agent.update(
+                policy_state,
+                action,
+                advantage,
+                self_signal=self_signal,
+                alpha=policy_alpha,
+                beta=policy_beta,
+            )
             agent.update_baseline(reward)
+            if meta_recent_steps > 0:
+                meta_recent_steps -= 1
+
+            nll = -math.log(max(self_state.probs_next[next_index], 1e-8))
+            cause_pred = 1 if self_state.probs_cause[1] >= self_state.probs_cause[0] else 0
+            cause_hit = 1 if cause_pred == cause_label else 0
+            energy_mse = (self_state.pred_energy - energy_target) ** 2
+
+            episode_nll += nll
+            episode_cause_hits += cause_hit
+            episode_energy_mse += energy_mse
+
             state = next_state
-            state_index = env.state_index(state)
+            state_index = next_index
+            steps += 1
             if done:
                 if state == env.cfg.goal:
                     reached_goal = 1
@@ -455,11 +565,19 @@ def run_training(episodes: int = 240) -> None:
             running_return = max(running_return, smoothed)
         window = success_history[-40:]
         success_rate = sum(window) / float(len(window))
+        avg_nll = episode_nll / float(max(steps, 1))
+        avg_cause = episode_cause_hits / float(max(steps, 1))
+        avg_energy = episode_energy_mse / float(max(steps, 1))
+        nll_history.append(avg_nll)
+        cause_history.append(avg_cause)
+        energy_history.append(avg_energy)
         logger.info(
-            "回合 %03d 平均回报 %.3f 成功率 %.2f",
+            "回合 %03d 平均回报 %.3f 成功率 %.2f NLL %.3f cause_acc %.2f",
             episode,
             running_return,
             success_rate,
+            avg_nll,
+            avg_cause,
         )
         return_history.append(running_return)
         if meta.should_trigger(list(return_history)):
@@ -478,11 +596,29 @@ def run_training(episodes: int = 240) -> None:
             )
             for meta_msg in meta_messages:
                 logger.info(meta_msg)
+            if any("accepted" in msg for msg in meta_messages):
+                meta_recent_steps = meta_effect_span
             return_history.clear()
 
     overall_success = sum(success_history[-60:]) / float(min(60, len(success_history)))
     logger.info("最近 60 回合成功率 %.2f", overall_success)
+    if nll_history:
+        window = min(20, len(nll_history))
+        tail_nll = sum(nll_history[-window:]) / float(window)
+        tail_cause = sum(cause_history[-window:]) / float(window)
+        tail_energy = sum(energy_history[-window:]) / float(window)
+        logger.info(
+            "尾部指标 NLL %.3f cause_acc %.2f energy_mse %.3f",
+            tail_nll,
+            tail_cause,
+            tail_energy,
+        )
     assert overall_success > 0.6, "终点成功率未超过 60%。"
+    if cause_history:
+        assert (
+            sum(cause_history[-20:]) / float(min(20, len(cause_history)))
+            >= 0.7
+        ), "自因分类准确率未达到 0.7。"
     assert meta.positive_ratio() >= 0.5, "自改 Δ>0 的比例未达到 50%。"
 
 

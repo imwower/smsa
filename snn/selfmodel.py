@@ -259,6 +259,7 @@ class SelfModel:
             energy_grad=energy_grad,
             cause_grad=cause_grad,
         )
+        return signals
 
 
 __all__ = ["SelfModel", "SelfModelState"]
