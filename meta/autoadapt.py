@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import copy
 import math
 import random
@@ -10,6 +11,58 @@ from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 
 EvaluationFn = Callable[[Any, int], float]
+
+
+class CodePatcher:
+    """根据表达式动态构造替代导数并应用到 DenseLIF 层。"""
+
+    DEFAULT_EXPRESSIONS = [
+        "g / ((1.0 + g * v * v) ** 2)",
+        "(1.0 - math.fabs(v) / (w if w > 1e-6 else 1e-6)) if math.fabs(v) <= w else 0.0",
+        "1.0 / (1.0 + g * math.fabs(v))",
+    ]
+
+    def __init__(self, expressions: Sequence[str] | None = None) -> None:
+        self.expressions = list(expressions) if expressions else list(self.DEFAULT_EXPRESSIONS)
+        if not self.expressions:
+            raise ValueError("必须提供至少一个代码表达式。")
+        self.current_idx = -1
+        self._validate_all()
+
+    def _validate_all(self) -> None:
+        for expr in self.expressions:
+            self._validate(expr)
+
+    def _validate(self, expr: str) -> None:
+        tree = ast.parse(expr, mode="eval")
+        allowed = {"v", "w", "g", "math"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id not in allowed:
+                raise ValueError(f"表达式包含非法标识符: {node.id}")
+
+    def _build(self, expr: str):
+        namespace = {"math": math}
+        code = (
+            "def dynamic_surrogate(v, w=1.0, g=2.0):\n"
+            f"    return {expr}\n"
+        )
+        exec(code, namespace, namespace)  # noqa: S102
+        return namespace["dynamic_surrogate"]
+
+    def next_expression(self) -> str:
+        self.current_idx = (self.current_idx + 1) % len(self.expressions)
+        return self.expressions[self.current_idx]
+
+    def apply(self, layer: Any, expression: str | None = None) -> str:
+        if expression is None:
+            expression = self.next_expression()
+        else:
+            self._validate(expression)
+        func = self._build(expression)
+        if not hasattr(layer, "set_surrogate"):
+            raise AttributeError("目标对象缺少 set_surrogate 方法。")
+        layer.set_surrogate(func)
+        return f"patch surrogate expr={expression}"
 
 @dataclass
 class AdaptationLog:

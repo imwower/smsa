@@ -9,12 +9,11 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
-from meta.autoadapt import MetaLearner
+from meta.autoadapt import CodePatcher, MetaLearner
 from snn.dense import DenseLIF
 from snn.lif import LIFParams, fast_sigmoid_surrogate, triangular_surrogate
 from snn.selfmodel import SelfModel
 from tools.logger import get_logger, setup_logging
-import ast
 
 
 Action = int  # 0:上, 1:下, 2:左, 3:右
@@ -24,54 +23,6 @@ def patched_surrogate(u: float, gain: float = 1.5) -> float:
     """基于代码热补丁的替代导数，提供更窄的梯度窗口。"""
     denom = 1.0 + gain * u * u
     return gain / (denom * denom)
-
-
-class CodePatcher:
-    """运行时构建替代导数函数，并应用到所有神经元。"""
-
-    DEFAULT_EXPRESSIONS = [
-        "(1.0 - math.fabs(v) / (w if w > 1e-6 else 1e-6)) if math.fabs(v) <= w else 0.0",
-        "1.0 if math.fabs(v) <= w else 0.0",
-        "g / ((1.0 + g * math.fabs(v)) ** 2)",
-    ]
-
-    def __init__(self, expressions: List[str] | None = None) -> None:
-        self.expressions = expressions[:] if expressions else self.DEFAULT_EXPRESSIONS[:]
-        self.current_idx = -1
-        self.last_patch_info: str | None = None
-        self._validate_all()
-
-    def _validate_all(self) -> None:
-        for expr in self.expressions:
-            self._validate_expression(expr)
-
-    def _validate_expression(self, expr: str) -> None:
-        tree = ast.parse(expr, mode="eval")
-        allowed = {"v", "w", "g", "math"}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name) and node.id not in allowed:
-                raise ValueError(f"表达式包含非法标识符: {node.id}")
-
-    def _build_function(self, expr: str):
-        namespace = {"math": math}
-        code = (
-            "def dynamic_surrogate(v, w=1.0, g=2.0):\n"
-            f"    return {expr}\n"
-        )
-        exec(code, namespace, namespace)
-        return namespace["dynamic_surrogate"]
-
-    def apply(self, layer: DenseLIF, idx: int | None = None) -> str:
-        if not self.expressions:
-            raise ValueError("无可用代码热补丁表达式。")
-        if idx is None:
-            idx = (self.current_idx + 1) % len(self.expressions)
-        expr = self.expressions[idx]
-        func = self._build_function(expr)
-        layer.set_surrogate(func)
-        self.current_idx = idx
-        self.last_patch_info = f"patch surrogate idx={idx}"
-        return self.last_patch_info
 
 
 @dataclass
@@ -402,9 +353,15 @@ class SNNAgent:
             self.inner_steps = max(self.inner_steps - 4, 8)
             return True, info
         if action == "add_neuron":
-            return self.add_neuron(), info
+            added = self.add_neuron()
+            if added:
+                info = f"n_hidden={self.hidden.n_out}"
+            return added, info
         if action == "prune_neuron":
-            return self.prune_neuron(), info
+            pruned = self.prune_neuron()
+            if pruned:
+                info = f"n_hidden={self.hidden.n_out}"
+            return pruned, info
         if action == "switch_surrogate":
             next_name = (
                 "triangular"
@@ -416,7 +373,7 @@ class SNNAgent:
         if action == "code_patch_surrogate":
             info = self.code_patcher.apply(self.hidden)
             self.patched = True
-            self.surrogate_name = f"dynamic_{self.code_patcher.current_idx}"
+            self.surrogate_name = "dynamic_patch"
             self.last_patch_info = info
             return True, info
         return False, info
