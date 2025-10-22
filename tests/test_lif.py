@@ -6,13 +6,18 @@ from snn.dense import DenseLIF
 from snn.lif import LIFParams, fast_sigmoid_surrogate
 
 
-def make_layer(tau_m: float, tau_a: float, v_th: float = 1.0) -> DenseLIF:
+def make_layer(
+    tau_m: float,
+    tau_a: float,
+    v_th: float = 1.5,
+    refractory: int = 2,
+) -> DenseLIF:
     params = LIFParams(
         v_th=v_th,
         tau_m=tau_m,
         tau_a=tau_a,
         beta=0.0,
-        refractory=2,
+        refractory=refractory,
     )
     layer = DenseLIF(
         n_in=1,
@@ -26,28 +31,41 @@ def make_layer(tau_m: float, tau_a: float, v_th: float = 1.0) -> DenseLIF:
 
 
 class TestLIFDynamics(unittest.TestCase):
-    def test_membrane_update_scales_with_tau_m(self) -> None:
+    def test_refractory_prevents_consecutive_spikes(self) -> None:
+        layer = make_layer(tau_m=2.0, tau_a=5.0, v_th=0.5, refractory=2)
+        layer.weights[0][0] = 5.0
+
+        spike_1, _, _, _ = layer.step([1])
+        spike_2, _, _, _ = layer.step([1])
+        spike_3, _, _, _ = layer.step([1])
+        spike_4, _, _, _ = layer.step([1])
+
+        self.assertEqual(spike_1[0], 1, "首次应触发放电")
+        self.assertEqual(spike_2[0], 0, "不应在不应期内重复放电")
+        self.assertEqual(spike_3[0], 0, "不应期未结束仍不应放电")
+        self.assertEqual(spike_4[0], 1, "不应期结束后应可再次放电")
+
+    def test_membrane_decay_is_slower_with_larger_tau_m(self) -> None:
         fast = make_layer(tau_m=2.0, tau_a=10.0)
         slow = make_layer(tau_m=10.0, tau_a=10.0)
-        fast.step([1])
-        slow.step([1])
-        self.assertGreater(fast.v[0], slow.v[0])
+        fast.v[0] = 1.0
+        slow.v[0] = 1.0
 
-    def test_adaptation_scales_with_tau_a(self) -> None:
-        layer_fast = make_layer(tau_m=2.0, tau_a=2.0)
-        layer_slow = make_layer(tau_m=2.0, tau_a=10.0)
-        layer_fast.weights[0][0] = 5.0
-        layer_slow.weights[0][0] = 5.0
-        layer_fast.step([1])
-        layer_slow.step([1])
-        self.assertGreater(layer_fast.a[0], layer_slow.a[0])
+        fast.step([0])
+        slow.step([0])
 
-    def test_threshold_reset_and_refractory(self) -> None:
-        layer = make_layer(tau_m=2.0, tau_a=10.0)
-        layer.weights[0][0] = 5.0
-        layer.step([1])
-        self.assertEqual(layer.v[0], 0.0)
-        self.assertEqual(layer.refractory[0], layer.params.refractory)
+        self.assertLess(fast.v[0], slow.v[0], "tau_m 更大时电位衰减应更慢")
+
+    def test_adaptation_decay_is_slower_with_larger_tau_a(self) -> None:
+        fast = make_layer(tau_m=2.0, tau_a=2.0)
+        slow = make_layer(tau_m=2.0, tau_a=10.0)
+        fast.a[0] = 1.0
+        slow.a[0] = 1.0
+
+        fast.step([0])
+        slow.step([0])
+
+        self.assertLess(fast.a[0], slow.a[0], "tau_a 更大时适应电流应衰减更慢")
 
 
 if __name__ == "__main__":
