@@ -90,6 +90,18 @@ class DenseLIF:
             psis[j] = psi
         return spikes, psis, eligibility_snapshot, bias_snapshot
 
+    def eprop_apply(self, learning_signal: Sequence[float], lr: float) -> None:
+        """根据学习信号与资格迹更新权重与偏置。"""
+        if len(learning_signal) != self.n_out:
+            raise ValueError("学习信号长度必须等于输出神经元数量。")
+        if lr <= 0.0:
+            raise ValueError("学习率必须为正数。")
+        for i in range(self.n_in):
+            for j in range(self.n_out):
+                self.weights[i][j] -= lr * learning_signal[j] * self.eligibility[i][j]
+        for j in range(self.n_out):
+            self.bias[j] -= lr * learning_signal[j] * self.bias_eligibility[j]
+
 
 class LinearTemporalUnit:
     """线性时序寄存器：s_t = α s_{t-1} + (1-α) f(x_t)。"""
