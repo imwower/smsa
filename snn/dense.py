@@ -89,3 +89,72 @@ class DenseLIF:
             bias_snapshot[j] = self.bias_eligibility[j]
             psis[j] = psi
         return spikes, psis, eligibility_snapshot, bias_snapshot
+
+
+class LinearTemporalUnit:
+    """线性时序寄存器：s_t = α s_{t-1} + (1-α) f(x_t)。"""
+
+    def __init__(
+        self,
+        n_in: int,
+        n_state: int,
+        beta: float = 0.85,
+    ) -> None:
+        self.n_in = n_in
+        self.n_state = n_state
+        self.beta = beta
+        self.weights = [
+            [0.0 for _ in range(n_state)]
+            for _ in range(n_in)
+        ]
+        self.bias = [0.0 for _ in range(n_state)]
+        self.gate_weights = [random.uniform(-0.2, 0.2) for _ in range(n_in)]
+        self.gate_bias = 0.0
+        self.reset()
+        self._init_identity()
+
+    def reset(self) -> None:
+        self.state = [0.0 for _ in range(self.n_state)]
+        self.gate_trace = 0.0
+
+    def _init_identity(self) -> None:
+        shared = min(self.n_in, self.n_state)
+        for i in range(self.n_in):
+            for j in range(self.n_state):
+                self.weights[i][j] = 0.0
+        for idx in range(shared):
+            self.weights[idx][idx] = 1.0
+
+    def transform(self, x: Sequence[float]) -> List[float]:
+        self.gate_trace = (
+            self.beta * self.gate_trace
+            + (1.0 - self.beta) * (sum(x) / float(max(len(x), 1)))
+        )
+        gate_input = self.gate_bias
+        for w, xv in zip(self.gate_weights, x):
+            gate_input += w * xv
+        gate_input += self.gate_trace
+        alpha = 1.0 / (1.0 + math.exp(-gate_input))
+        alpha = max(0.05, min(0.95, alpha))
+        f_vals: List[float] = []
+        for j in range(self.n_state):
+            acc = self.bias[j]
+            for i in range(self.n_in):
+                acc += self.weights[i][j] * x[i]
+            f_vals.append(acc)
+        self.state = [
+            alpha * self.state[j] + (1.0 - alpha) * f_vals[j]
+            for j in range(self.n_state)
+        ]
+        return self.state[:]
+
+    def reinit(self) -> None:
+        self.weights = [
+            [0.0 for _ in range(self.n_state)]
+            for _ in range(self.n_in)
+        ]
+        self.bias = [0.0 for _ in range(self.n_state)]
+        self.gate_weights = [random.uniform(-0.2, 0.2) for _ in range(self.n_in)]
+        self.gate_bias = 0.0
+        self.reset()
+        self._init_identity()

@@ -11,7 +11,7 @@ import copy
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
-from snn.dense import DenseLIF
+from snn.dense import DenseLIF, LinearTemporalUnit
 from snn.lif import LIFParams, fast_sigmoid_surrogate
 from tools.logger import get_logger, setup_logging
 
@@ -149,9 +149,24 @@ class SNNPolicy:
         readout_lr: float = 0.3,
         clip: float = 2.0,
         intrinsic_beta: float = 0.2,
+        use_temporal_unit: bool = False,
+        temporal_state_size: int | None = None,
     ) -> None:
+        self.state_size = state_size
+        self.use_temporal_unit = use_temporal_unit
+        self.temporal_state_size = (
+            temporal_state_size if temporal_state_size is not None else state_size
+        )
+        input_dim = (
+            state_size + self.temporal_state_size if use_temporal_unit else state_size
+        )
+        self.temporal_unit = (
+            LinearTemporalUnit(state_size, self.temporal_state_size)
+            if use_temporal_unit
+            else None
+        )
         self.hidden = DenseLIF(
-            n_in=state_size,
+            n_in=input_dim,
             n_out=hidden_size,
             params=params,
             surrogate_fn=fast_sigmoid_surrogate,
@@ -169,7 +184,6 @@ class SNNPolicy:
         self.clip = clip
         self.baseline = 0.0
         self.baseline_beta = 0.05
-        self.state_size = state_size
         self.intrinsic_beta = intrinsic_beta
 
     def encode_state(self, index: int) -> List[int]:
@@ -184,12 +198,19 @@ class SNNPolicy:
         eligibility_history: List[List[List[float]]] = []
         bias_history: List[List[float]] = []
         for _ in range(self.inner_steps):
-            pre_spikes = [
-                spike_from_rate(self.high_rate if bit else self.low_rate)
+            base_input = [
+                float(
+                    spike_from_rate(self.high_rate if bit else self.low_rate)
+                )
                 for bit in bits
             ]
+            if self.temporal_unit is not None:
+                temporal_state = self.temporal_unit.transform(base_input)
+                combined_input = base_input + temporal_state
+            else:
+                combined_input = base_input
             spikes, _, eligibility_snapshot, bias_snapshot = self.hidden.step(
-                pre_spikes
+                combined_input
             )
             hidden_counts = [c + s for c, s in zip(hidden_counts, spikes)]
             eligibility_history.append([row[:] for row in eligibility_snapshot])
@@ -279,6 +300,12 @@ class SNNPolicy:
         ]
         self.readout_bias = [0.0 for _ in range(4)]
         self.baseline = 0.0
+        if self.temporal_unit is not None:
+            self.temporal_unit.reinit()
+
+    def begin_episode(self) -> None:
+        if self.temporal_unit is not None:
+            self.temporal_unit.reset()
 
 
 @dataclass
@@ -486,6 +513,7 @@ def dream_replay(
     if len(buffer) < 20:
         return
     for _ in range(sequences):
+        agent.begin_episode()
         start_state_idx, _, _, _, _ = buffer.sample()
         current_idx = start_state_idx
         for _ in range(random.randint(3, 5)):
@@ -543,6 +571,7 @@ def simulate_recovery(
     for episode in range(1, max_episodes + 1):
         env = GridWorld(env_cfg)
         state = env.reset()
+        agent.begin_episode()
         state_index = env.state_index(state)
         steps = 0
         reached_goal = 0
@@ -681,6 +710,7 @@ def run_training(episodes: int = 140) -> None:
 
     for episode in range(1, episodes + 1):
         state = env.reset()
+        policy.begin_episode()
         state_index = env.state_index(state)
         episode_reward = 0.0
         episode_nll = 0.0
@@ -808,6 +838,7 @@ def run_training(episodes: int = 140) -> None:
             success_window.clear()
             running_return = None
             buffer_snapshot = ReplayBuffer(capacity=buffer.capacity)
+            buffer_snapshot.data.extend(buffer.data)
             baseline_agent = copy.deepcopy(policy)
             baseline_self_model = SelfModel(
                 input_size=self_model.hidden.n_in,
