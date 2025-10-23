@@ -1,12 +1,12 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-Core spiking-neuron modules live in `snn/`: `lif.py` for neuron dynamics, `dense.py` for synaptic layers, `policy.py` for decision heads, and `selfmodel.py` for self-prediction. Experiments and training entry points sit in `scripts/` (e.g., `scripts/train_gridworld.py`), while light-weight GridWorld environments are in `envs/`. Meta-control helpers reside in `meta/autoadapt.py`, and shared logging utilities are under `tools/logger.py`. Tests mirror this layout inside `tests/` (`tests/test_lif.py`, `tests/test_meta.py`). Standalone baselines (`snn_py_evo.py`, `snn_py_explore_auto.py`, `snn_self_agent.py`) should stay behaviorally aligned with the modular code.
+Core spiking-neuron modules live in `snn/`: `lif.py` for neuron dynamics, `dense.py` for synaptic layers, `policy.py` for decision heads, and `selfmodel.py` for self-prediction. Experiments and training entry points sit in `scripts/` (e.g., `scripts/train_gridworld.py`), while light-weight GridWorld environments are in `envs/`. Meta-control helpers reside in `meta/autoadapt.py`, and shared logging utilities are under `tools/logger.py`. Tests mirror this layout inside `tests/` (`tests/test_lif.py`, `tests/test_meta.py`). Scripted baselines now flow through `scripts/train_xor.py`, `scripts/train_gridworld.py`, and `scripts/train_smsa.py` to stay aligned with the modular code.
 
 ## Build, Test, and Development Commands
-- `python snn_py_evo.py` — run the XOR smoke test; expect ≥0.9 accuracy within ~30 epochs.
+- `python scripts/train_xor.py` — run the XOR smoke test; expect ≥0.9 accuracy within ~30 epochs.
 - `python scripts/train_gridworld.py --episodes 80 --seed 0` — launch the staged GridWorld exploration loop; adjust intrinsic reward flags as needed.
-- `python snn_self_agent.py` — execute the full self-model pipeline and watch `[meta]` logs for adaptation checkpoints.
+- `python scripts/train_smsa.py` — execute the full self-model pipeline and watch `[meta]` logs for adaptation checkpoints.
 - `python -m unittest discover tests` — execute the regression suite; add `--seed <int>` for deterministic runs.
 - `python scripts/eval_metrics.py --run runs/exp_001` — regenerate CSV analytics for a completed training run.
 

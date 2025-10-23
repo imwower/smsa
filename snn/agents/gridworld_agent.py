@@ -1,86 +1,39 @@
-"""GridWorld 主动探索 + REINFORCE + 自适应 MetaLearner 原型。"""
+"""GridWorld-specific spiking policy agent utilities."""
 
 from __future__ import annotations
 
-import copy
 import math
 import random
-from collections import defaultdict, deque
-from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
-from meta.autoadapt import CodePatcher, MetaLearner
+from meta.autoadapt import CodePatcher
+from snn.agents.base import PolicyState
 from snn.dense import DenseLIF, LinearTemporalUnit
 from snn.lif import LIFParams, fast_sigmoid_surrogate, triangular_surrogate
-from snn.selfmodel import SelfModel
-from tools.logger import get_logger, setup_logging
 
 
-Action = int  # 0:上, 1:下, 2:左, 3:右
+Action = int  # 0: 上, 1: 下, 2: 左, 3: 右
 
 
 def patched_surrogate(u: float, gain: float = 1.5) -> float:
-    """基于代码热补丁的替代导数，提供更窄的梯度窗口。"""
+    """Code patch surrogate: narrower gradient window for sharper spikes."""
     denom = 1.0 + gain * u * u
     return gain / (denom * denom)
 
 
-@dataclass
-class GridWorldConfig:
-    size: int = 5
-    slip: float = 0.05
-    max_steps: int = 60
-    start: Tuple[int, int] = (0, 0)
-    goal: Tuple[int, int] = (4, 4)
-    goal_reward: float = 1.0
-    step_penalty: float = -0.01
-
-
-class GridWorld:
-    def __init__(self, cfg: GridWorldConfig) -> None:
-        self.cfg = cfg
-        self.position = cfg.start
-        self.steps = 0
-
-    def reset(self) -> Tuple[int, int]:
-        self.position = self.cfg.start
-        self.steps = 0
-        return self.position
-
-    def state_index(self, pos: Tuple[int, int]) -> int:
-        return pos[0] * self.cfg.size + pos[1]
-
-    def step(self, action: Action) -> Tuple[Tuple[int, int], float, bool]:
-        self.steps += 1
-        if random.random() < self.cfg.slip:
-            action = random.randint(0, 3)
-        drc = [(-1, 0), (1, 0), (0, -1), (0, 1)][action]
-        nr = max(0, min(self.cfg.size - 1, self.position[0] + drc[0]))
-        nc = max(0, min(self.cfg.size - 1, self.position[1] + drc[1]))
-        self.position = (nr, nc)
-        reward = self.cfg.step_penalty
-        done = False
-        if self.position == self.cfg.goal:
-            reward += self.cfg.goal_reward
-            done = True
-        if self.steps >= self.cfg.max_steps:
-            done = True
-        return self.position, reward, done
-
-
-def softmax(logits: Sequence[float]) -> List[float]:
+def _softmax(logits: Sequence[float]) -> List[float]:
     max_logit = max(logits)
     exps = [math.exp(l - max_logit) for l in logits]
     total = sum(exps)
     return [e / total for e in exps]
 
 
-def spike_from_rate(rate: float) -> int:
+def _spike_from_rate(rate: float) -> int:
     rate = max(0.0, min(1.0, rate))
     return 1 if random.random() < rate else 0
 
 
-def clip_value(value: float, limit: float) -> float:
+def _clip_value(value: float, limit: float) -> float:
     if value > limit:
         return limit
     if value < -limit:
@@ -89,6 +42,7 @@ def clip_value(value: float, limit: float) -> float:
 
 
 def build_self_model_input(
+    *,
     state_index: int,
     action: int,
     mean_rate: float,
@@ -97,6 +51,7 @@ def build_self_model_input(
     v_th: float,
     state_size: int,
 ) -> List[float]:
+    """Compose Self-Model input features from policy signals."""
     obs_vec = [0.0 for _ in range(state_size)]
     obs_vec[state_index] = 1.0
     action_vec = [0.0 for _ in range(4)]
@@ -110,20 +65,12 @@ def build_self_model_input(
     return obs_vec + action_vec + extras
 
 
-@dataclass
-class PolicyState:
-    probs: List[float]
-    eligibility_history: List[List[List[float]]]
-    bias_history: List[List[float]]
-    hidden_rates: List[float]
-    hidden_counts: List[int]
-    mean_rate: float
-    sum_rate: float
+class GridworldAgent:
+    """DenseLIF policy agent with intrinsic reward and meta hooks."""
 
-
-class SNNAgent:
     def __init__(
         self,
+        *,
         state_size: int,
         hidden_size: int,
         params: LIFParams,
@@ -195,7 +142,7 @@ class SNNAgent:
             )
             temporal_rates = [max(0.0, min(rate, 1.0)) for rate in temporal_state]
             combined_rates = base_rates + temporal_rates
-            pre_spikes = [spike_from_rate(rate) for rate in combined_rates]
+            pre_spikes = [_spike_from_rate(rate) for rate in combined_rates]
             spikes, _, eligibility_snapshot, bias_snapshot = self.hidden.step(
                 pre_spikes
             )
@@ -209,7 +156,7 @@ class SNNAgent:
             for h in range(self.hidden.n_out):
                 logit += self.readout_weights[h][action] * hidden_rates[h]
             logits.append(logit)
-        probs = softmax(logits)
+        probs = _softmax(logits)
         total_spikes = sum(hidden_counts)
         mean_rate = (total_spikes / max(self.hidden.n_out, 1)) / float(self.inner_steps)
         sum_rate = min(total_spikes / float(self.inner_steps), 1.0)
@@ -251,14 +198,14 @@ class SNNAgent:
         policy_error = [p for p in state.probs]
         policy_error[action] -= 1.0
         policy_error = [
-            clip_value(err * advantage, self.clip) for err in policy_error
+            _clip_value(err * advantage, self.clip) for err in policy_error
         ]
         learning_signals = []
         for h in range(self.hidden.n_out):
             signal = 0.0
             for a in range(4):
                 signal += policy_error[a] * self.readout_weights[h][a]
-            learning_signals.append(clip_value(signal, self.clip))
+            learning_signals.append(_clip_value(signal, self.clip))
         if self_signal is not None:
             if len(self_signal) != self.hidden.n_out:
                 adjusted = [0.0 for _ in range(self.hidden.n_out)]
@@ -269,29 +216,29 @@ class SNNAgent:
             combined = []
             for h in range(self.hidden.n_out):
                 combined_signal = alpha * learning_signals[h] + beta * self_signal[h]
-                combined.append(clip_value(combined_signal, self.clip))
+                combined.append(_clip_value(combined_signal, self.clip))
             learning_signals = combined
         else:
-            learning_signals = [clip_value(alpha * sig, self.clip) for sig in learning_signals]
+            learning_signals = [_clip_value(alpha * sig, self.clip) for sig in learning_signals]
         for i in range(self.hidden.n_in):
             for h in range(self.hidden.n_out):
                 grad = 0.0
                 for elig in state.eligibility_history:
                     grad += learning_signals[h] * elig[i][h]
-                grad = clip_value(grad, self.clip)
+                grad = _clip_value(grad, self.clip)
                 self.hidden.weights[i][h] -= self.hidden_lr * grad
         for h in range(self.hidden.n_out):
             grad = 0.0
             for bias_elig in state.bias_history:
                 grad += learning_signals[h] * bias_elig[h]
-            grad = clip_value(grad, self.clip)
+            grad = _clip_value(grad, self.clip)
             self.hidden.bias[h] -= self.hidden_lr * grad
         for h in range(self.hidden.n_out):
             for a in range(4):
-                grad = clip_value(policy_error[a] * state.hidden_rates[h], self.clip)
+                grad = _clip_value(policy_error[a] * state.hidden_rates[h], self.clip)
                 self.readout_weights[h][a] -= self.readout_lr * grad
         for a in range(4):
-            grad = clip_value(policy_error[a], self.clip)
+            grad = _clip_value(policy_error[a], self.clip)
             self.readout_bias[a] -= self.readout_lr * grad
 
     def set_surrogate(self, name: str) -> None:
@@ -395,207 +342,9 @@ class SNNAgent:
         return False, info
 
 
-def evaluate_agent(
-    agent: SNNAgent,
-    env_cfg: GridWorldConfig,
-    episodes: int,
-    seed: int,
-) -> float:
-    state = random.getstate()
-    random.seed(seed)
-    total_reward = 0.0
-    for _ in range(episodes):
-        env = GridWorld(env_cfg)
-        visit_counts: Dict[int, int] = defaultdict(int)
-        pos = env.reset()
-        idx = env.state_index(pos)
-        agent.begin_episode()
-        steps = 0
-        while steps < env.cfg.max_steps:
-            pol_state = agent.forward(idx)
-            action = agent.sample_action(pol_state.probs)
-            bonus = agent.intrinsic_bonus(visit_counts[idx])
-            visit_counts[idx] += 1
-            next_state, base_reward, done = env.step(action)
-            reward = base_reward + bonus
-            total_reward += reward
-            idx = env.state_index(next_state)
-            steps += 1
-            if done:
-                break
-    random.setstate(state)
-    return total_reward / float(max(episodes, 1))
-
-
-def run_training(episodes: int = 240) -> None:
-    setup_logging()
-    logger = get_logger(__name__)
-
-    env_cfg = GridWorldConfig()
-    env = GridWorld(env_cfg)
-    params = LIFParams(v_th=0.5, tau_m=9.0, tau_a=18.0, beta=0.4, refractory=2)
-    agent = SNNAgent(
-        state_size=env_cfg.size * env_cfg.size,
-        hidden_size=24,
-        params=params,
-    )
-    self_params = LIFParams(v_th=0.5, tau_m=10.0, tau_a=20.0, beta=0.35, refractory=2)
-    self_model = SelfModel(
-        obs_dim=env_cfg.size * env_cfg.size,
-        action_dim=4,
-        hidden_size=24,
-        lif_params=self_params,
-    )
-    visit_counts: Dict[int, int] = defaultdict(int)
-    meta = MetaLearner(window=20, min_delta=0.05)
-    return_history: deque[float] = deque(maxlen=meta.window)
-    running_return: float | None = None
-    success_history: List[int] = []
-    nll_history: List[float] = []
-    cause_history: List[float] = []
-    energy_history: List[float] = []
-    policy_alpha = 1.0
-    policy_beta = 0.4
-    meta_effect_span = 12
-    meta_recent_steps = 0
-
-    for episode in range(1, episodes + 1):
-        state = env.reset()
-        agent.begin_episode()
-        state_index = env.state_index(state)
-        episode_reward = 0.0
-        reached_goal = 0
-        episode_nll = 0.0
-        episode_cause_hits = 0
-        episode_energy_mse = 0.0
-        steps = 0
-        while steps < env.cfg.max_steps:
-            policy_state = agent.forward(state_index)
-            action = agent.sample_action(policy_state.probs)
-            bonus = agent.intrinsic_bonus(visit_counts[state_index])
-            visit_counts[state_index] += 1
-            features = build_self_model_input(
-                state_index=state_index,
-                action=action,
-                mean_rate=policy_state.mean_rate,
-                sum_rate=policy_state.sum_rate,
-                eta_e=agent.hidden_lr,
-                v_th=agent.hidden.params.v_th,
-                state_size=env_cfg.size * env_cfg.size,
-            )
-            self_state = self_model.forward(features)
-
-            next_state, base_reward, done = env.step(action)
-            reward = base_reward + bonus
-            episode_reward += reward
-            advantage = reward - agent.baseline
-            next_index = env.state_index(next_state)
-
-            energy_target = min(
-                sum(policy_state.hidden_counts)
-                / float(agent.inner_steps * agent.hidden.n_out),
-                1.0,
-            )
-            cause_label = 1 if meta_recent_steps > 0 else 0
-            self_signal = self_model.update(
-                state=self_state,
-                next_obs_index=next_index,
-                reward_target=reward,
-                energy_target=energy_target,
-                cause_label=cause_label,
-            )
-            agent.update(
-                policy_state,
-                action,
-                advantage,
-                self_signal=self_signal,
-                alpha=policy_alpha,
-                beta=policy_beta,
-            )
-            agent.update_baseline(reward)
-            if meta_recent_steps > 0:
-                meta_recent_steps -= 1
-
-            nll = -math.log(max(self_state.probs_next[next_index], 1e-8))
-            cause_pred = 1 if self_state.probs_cause[1] >= self_state.probs_cause[0] else 0
-            cause_hit = 1 if cause_pred == cause_label else 0
-            energy_mse = (self_state.pred_energy - energy_target) ** 2
-
-            episode_nll += nll
-            episode_cause_hits += cause_hit
-            episode_energy_mse += energy_mse
-
-            state = next_state
-            state_index = next_index
-            steps += 1
-            if done:
-                if state == env.cfg.goal:
-                    reached_goal = 1
-                break
-        success_history.append(reached_goal)
-        if running_return is None:
-            running_return = episode_reward
-        else:
-            smoothed = 0.9 * running_return + 0.1 * episode_reward
-            running_return = max(running_return, smoothed)
-        window = success_history[-40:]
-        success_rate = sum(window) / float(len(window))
-        avg_nll = episode_nll / float(max(steps, 1))
-        avg_cause = episode_cause_hits / float(max(steps, 1))
-        avg_energy = episode_energy_mse / float(max(steps, 1))
-        nll_history.append(avg_nll)
-        cause_history.append(avg_cause)
-        energy_history.append(avg_energy)
-        logger.info(
-            "回合 %03d 平均回报 %.3f 成功率 %.2f NLL %.3f cause_acc %.2f",
-            episode,
-            running_return,
-            success_rate,
-            avg_nll,
-            avg_cause,
-        )
-        return_history.append(running_return)
-        if meta.should_trigger(list(return_history)):
-            def evaluate_for_meta(candidate_agent: SNNAgent, seed: int) -> float:
-                return evaluate_agent(
-                    candidate_agent,
-                    env_cfg,
-                    episodes=meta.ab_episodes,
-                    seed=seed,
-                )
-
-            agent, meta_messages = meta.adapt(
-                agent,
-                step=episode,
-                evaluate_fn=evaluate_for_meta,
-            )
-            for meta_msg in meta_messages:
-                logger.info(meta_msg)
-            if any("accepted" in msg for msg in meta_messages):
-                meta_recent_steps = meta_effect_span
-            return_history.clear()
-
-    overall_success = sum(success_history[-60:]) / float(min(60, len(success_history)))
-    logger.info("最近 60 回合成功率 %.2f", overall_success)
-    if nll_history:
-        window = min(20, len(nll_history))
-        tail_nll = sum(nll_history[-window:]) / float(window)
-        tail_cause = sum(cause_history[-window:]) / float(window)
-        tail_energy = sum(energy_history[-window:]) / float(window)
-        logger.info(
-            "尾部指标 NLL %.3f cause_acc %.2f energy_mse %.3f",
-            tail_nll,
-            tail_cause,
-            tail_energy,
-        )
-    assert overall_success > 0.6, "终点成功率未超过 60%。"
-    if cause_history:
-        assert (
-            sum(cause_history[-20:]) / float(min(20, len(cause_history)))
-            >= 0.7
-        ), "自因分类准确率未达到 0.7。"
-    assert meta.positive_ratio() >= 0.5, "自改 Δ>0 的比例未达到 50%。"
-
-
-if __name__ == "__main__":
-    run_training()
+__all__ = [
+    "Action",
+    "GridworldAgent",
+    "build_self_model_input",
+    "patched_surrogate",
+]
