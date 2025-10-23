@@ -93,16 +93,15 @@ class MetaLearner:
         *,
         window: int = 20,
         min_delta: float = 0.05,
-        ucb_c: float = 0.4,
+        ucb_c: float = 0.6,
         ab_episodes: int = 5,
-        fallback_action: str = "eta_up",
+        candidates: Sequence[str] | None = None,
     ) -> None:
         self.window = window
         self.min_delta = min_delta
         self.ucb_c = ucb_c
         self.ab_episodes = ab_episodes
-        self.fallback_action = fallback_action
-        self.candidates: List[str] = [
+        default_candidates = [
             "eta_up",
             "eta_down",
             "vth_up",
@@ -111,15 +110,14 @@ class MetaLearner:
             "intrinsic_down",
             "inner_up",
             "inner_down",
-            "add_neuron",
-            "prune_neuron",
             "switch_surrogate",
             "patch_surrogate",
         ]
+        self.candidates: List[str] = list(candidates) if candidates else default_candidates
         self.counts: Dict[str, int] = {c: 0 for c in self.candidates}
         self.totals: Dict[str, float] = {c: 0.0 for c in self.candidates}
         self.attempts = 0
-        self.positives = 0
+        self._positives = 0
         self._seed_base = 1337
         self._rng = random.Random(2024)
 
@@ -132,19 +130,13 @@ class MetaLearner:
 
     def select_candidate(self) -> str:
         """使用 UCB 对候选改动进行选择。"""
-        total = sum(max(1, self.counts[c]) for c in self.candidates)
-        exploration = max(total, 2)
+        exploration = sum(max(1, self.counts[c]) for c in self.candidates) + 1
         best_score = -float("inf")
         best_candidate = self.candidates[0]
         for action in self.candidates:
-            mean = (
-                self.totals[action] / self.counts[action]
-                if self.counts[action] > 0
-                else 0.05
-            )
-            bonus = math.sqrt(
-                2.0 * math.log(exploration) / max(1, self.counts[action])
-            )
+            trials = max(1, self.counts[action])
+            mean = self.totals[action] / trials if self.counts[action] > 0 else 0.0
+            bonus = math.sqrt(2.0 * math.log(exploration) / trials)
             score = mean + self.ucb_c * bonus
             if (
                 score > best_score + 1e-9
@@ -158,7 +150,7 @@ class MetaLearner:
         """返回带来正收益的改动比例。"""
         if self.attempts == 0:
             return 1.0
-        return self.positives / float(self.attempts)
+        return self._positives / float(self.attempts)
 
     def adapt(
         self,
@@ -169,43 +161,37 @@ class MetaLearner:
     ) -> Tuple[Any, List[str]]:
         """执行一次自改尝试，返回可能更新的 agent 和日志。"""
         seed = self._seed_base + step * 97
-        before = evaluate_fn(copy.deepcopy(agent), seed)
-        candidates = [self.select_candidate()]
-        if self.fallback_action not in candidates:
-            candidates.append(self.fallback_action)
-
+        baseline_score = evaluate_fn(copy.deepcopy(agent), seed)
+        action = self.select_candidate()
+        original_snapshot = copy.deepcopy(agent)
+        applied, info = agent.apply_modification(action)
+        delta = -self.min_delta
+        reverted = True
         messages: List[str] = []
-        for idx, action in enumerate(candidates):
-            backup = copy.deepcopy(agent)
-            applied, info = agent.apply_modification(action)
-            delta = -self.min_delta
-            reverted = True
-            if applied:
-                after = evaluate_fn(copy.deepcopy(agent), seed)
-                delta = after - before
-                if delta >= 0.0:
-                    reverted = False
-                    self.positives += 1
-                else:
-                    agent = backup
+        if applied:
+            after_score = evaluate_fn(copy.deepcopy(agent), seed)
+            delta = after_score - baseline_score
+            if delta > 0.0:
+                reverted = False
+                self._positives += 1
             else:
-                agent = backup
-            self.attempts += 1
-            self.counts[action] += 1
-            self.totals[action] += delta
-            log = AdaptationLog(
-                step=step,
-                action=action,
-                delta=delta,
-                reverted=reverted,
-                info=info,
-                positive_ratio=self.positive_ratio(),
-            )
-            message = log.format()
-            messages.append(message)
-            print(message)
-            if not reverted:
-                break
+                agent = original_snapshot
+        else:
+            agent = original_snapshot
+        self.attempts += 1
+        self.counts[action] += 1
+        self.totals[action] += delta
+        log = AdaptationLog(
+            step=step,
+            action=action,
+            delta=delta,
+            reverted=reverted,
+            info=info,
+            positive_ratio=self.positive_ratio(),
+        )
+        message = log.format()
+        messages.append(message)
+        print(message)
         return agent, messages
 
 
