@@ -10,7 +10,13 @@ from typing import List, Sequence, Tuple
 class PolicyHead:
     """简单的全连接 softmax 策略头。"""
 
-    def __init__(self, n_in: int, n_actions: int, lr: float) -> None:
+    def __init__(
+        self,
+        n_in: int,
+        n_actions: int,
+        lr: float,
+        seed: int | None = None,
+    ) -> None:
         if n_in <= 0 or n_actions <= 0:
             raise ValueError("n_in 和 n_actions 必须为正整数。")
         if lr <= 0:
@@ -28,7 +34,7 @@ class PolicyHead:
             for _ in range(n_actions)
         ]
         self.bias: List[float] = [0.0 for _ in range(n_actions)]
-        self._rng = random.Random()
+        self._rng = random.Random(seed)
 
     def logits(self, counts: Sequence[float]) -> List[float]:
         """计算每个动作的线性得分。"""
@@ -55,21 +61,22 @@ class PolicyHead:
             raise ZeroDivisionError("softmax 归一化因子为 0。")
         return [v / denom for v in exp_scores]
 
-    def sample_action(self, counts: Sequence[float]) -> Tuple[int, float]:
-        """按策略分布采样动作，返回 (动作编号, 概率)。"""
-        probs = self.softmax(self.logits(counts))
+    def sample_action(self, probs: Sequence[float]) -> int:
+        """按给定概率分布采样动作。"""
+        if len(probs) != self.n_actions:
+            raise ValueError("概率向量长度必须等于 n_actions。")
+        total = sum(probs)
+        if total <= 0.0:
+            raise ValueError("概率向量总和必须为正值。")
         sample = self._rng.random()
         cumulative = 0.0
         for idx, prob in enumerate(probs):
-            cumulative += prob
-            if sample <= cumulative:
-                return idx, prob
-        # 避免浮点误差导致没有返回。
-        return self.n_actions - 1, probs[-1]
+            cumulative += prob / total
+            if sample <= cumulative or idx == self.n_actions - 1:
+                return idx
+        return self.n_actions - 1
 
-    def policy_grad(
-        self, counts: Sequence[float], action: int, probs: Sequence[float]
-    ) -> List[float]:
+    def policy_grad(self, probs: Sequence[float], action: int) -> List[float]:
         """计算策略梯度的动作维度项，即 p - 1_hot(a)。"""
         if len(probs) != self.n_actions:
             raise ValueError("概率向量长度必须等于 n_actions。")
@@ -126,12 +133,14 @@ def _train_toy_demo() -> None:
         counts, label = dataset[step % len(dataset)]
         scores = head.logits(counts)
         probs = head.softmax(scores)
-        # 交叉熵损失。
+        action = head.sample_action(probs)
+        reward = 1.0 if action == label else 0.0
+        advantage = reward - 0.5
         loss = -math.log(max(probs[label], 1e-12))
         losses.append(loss)
 
-        grad = head.policy_grad(counts, label, probs)
-        head.update(counts, grad, advantage=1.0)
+        grad = head.policy_grad(probs, action)
+        head.update(counts, grad, advantage)
 
     # 评估分类准确率。
     correct = 0
