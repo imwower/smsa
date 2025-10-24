@@ -96,6 +96,7 @@ class MetaLearner:
         ucb_c: float = 0.6,
         ab_episodes: int = 5,
         candidates: Sequence[str] | None = None,
+        fallback_action: str | None = None,
     ) -> None:
         self.window = window
         self.min_delta = min_delta
@@ -110,6 +111,8 @@ class MetaLearner:
             "intrinsic_down",
             "inner_up",
             "inner_down",
+            "add_neuron",
+            "prune_neuron",
             "switch_surrogate",
             "patch_surrogate",
         ]
@@ -120,6 +123,13 @@ class MetaLearner:
         self._positives = 0
         self._seed_base = 1337
         self._rng = random.Random(2024)
+        self.fallback_action = fallback_action
+        if (
+            self.fallback_action
+            and self.fallback_action not in self.counts
+        ):
+            self.counts[self.fallback_action] = 0
+            self.totals[self.fallback_action] = 0.0
 
     def should_trigger(self, history: Sequence[float]) -> bool:
         """判断是否进入平台期。"""
@@ -164,34 +174,54 @@ class MetaLearner:
         baseline_score = evaluate_fn(copy.deepcopy(agent), seed)
         action = self.select_candidate()
         original_snapshot = copy.deepcopy(agent)
-        applied, info = agent.apply_modification(action)
-        delta = -self.min_delta
-        reverted = True
         messages: List[str] = []
-        if applied:
-            after_score = evaluate_fn(copy.deepcopy(agent), seed)
-            delta = after_score - baseline_score
-            if delta > 0.0:
-                reverted = False
-                self._positives += 1
+        chosen_agent = original_snapshot
+        actions_to_try = [action]
+        if (
+            self.fallback_action
+            and self.fallback_action not in actions_to_try
+        ):
+            actions_to_try.append(self.fallback_action)
+
+        for candidate_action in actions_to_try:
+            trial_agent = copy.deepcopy(original_snapshot)
+            applied, info = trial_agent.apply_modification(candidate_action)
+            delta = -self.min_delta
+            reverted = True
+            if applied:
+                after_score = evaluate_fn(copy.deepcopy(trial_agent), seed)
+                delta = after_score - baseline_score
+                if delta >= 0.0:
+                    reverted = False
+                    chosen_agent = trial_agent
+                    if delta > 0.0:
+                        self._positives += 1
+                else:
+                    trial_agent = original_snapshot
             else:
-                agent = original_snapshot
+                trial_agent = original_snapshot
+            self.attempts += 1
+            if candidate_action not in self.counts:
+                self.counts[candidate_action] = 0
+                self.totals[candidate_action] = 0.0
+            self.counts[candidate_action] += 1
+            self.totals[candidate_action] += delta
+            log = AdaptationLog(
+                step=step,
+                action=candidate_action,
+                delta=delta,
+                reverted=reverted,
+                info=info,
+                positive_ratio=self.positive_ratio(),
+            )
+            message = log.format()
+            messages.append(message)
+            print(message)
+            if not reverted:
+                agent = chosen_agent
+                break
         else:
             agent = original_snapshot
-        self.attempts += 1
-        self.counts[action] += 1
-        self.totals[action] += delta
-        log = AdaptationLog(
-            step=step,
-            action=action,
-            delta=delta,
-            reverted=reverted,
-            info=info,
-            positive_ratio=self.positive_ratio(),
-        )
-        message = log.format()
-        messages.append(message)
-        print(message)
         return agent, messages
 
 

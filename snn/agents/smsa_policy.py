@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import math
 import random
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 
+from meta.autoadapt import CodePatcher
 from snn.agents.base import PolicyState
 from snn.dense import DenseLIF, LinearTemporalUnit
-from snn.lif import LIFParams, fast_sigmoid_surrogate
+from snn.lif import LIFParams, fast_sigmoid_surrogate, triangular_surrogate
+
+
+def patched_surrogate(u: float, slope: float = 1.5) -> float:
+    """自定义补丁替代导数，收缩梯度窗口以提升灵敏度。"""
+    denom = 1.0 + slope * u * u
+    return slope / (denom * denom)
 
 
 def _softmax(logits: Sequence[float]) -> List[float]:
@@ -106,6 +113,9 @@ class SNNPolicy:
         self.baseline = 0.0
         self.baseline_beta = 0.05
         self.intrinsic_beta = intrinsic_beta
+        self.surrogate_name = "fast_sigmoid"
+        self.code_patcher = CodePatcher()
+        self.last_patch_info: str | None = None
 
     def encode_state(self, index: int) -> List[int]:
         vec = [0 for _ in range(self.state_size)]
@@ -248,6 +258,83 @@ class SNNPolicy:
     def begin_episode(self) -> None:
         if self.temporal_unit is not None:
             self.temporal_unit.reset()
+
+    def apply_modification(self, action: str) -> Tuple[bool, str | None]:
+        """为 MetaLearner 提供自改动作入口。"""
+        info: str | None = None
+        if action == "eta_up":
+            self.hidden_lr = min(self.hidden_lr * 1.25, 0.2)
+            self.readout_lr = min(self.readout_lr * 1.15, 0.45)
+            self.baseline_beta = min(self.baseline_beta * 1.1, 0.2)
+            return True, info
+        if action == "eta_down":
+            self.hidden_lr = max(self.hidden_lr * 0.8, 0.02)
+            self.readout_lr = max(self.readout_lr * 0.8, 0.05)
+            self.baseline_beta = max(self.baseline_beta * 0.9, 0.02)
+            return True, info
+        if action == "vth_up":
+            self.hidden.params.v_th = min(self.hidden.params.v_th + 0.05, 1.2)
+            return True, f"v_th={self.hidden.params.v_th:.2f}"
+        if action == "vth_down":
+            self.hidden.params.v_th = max(self.hidden.params.v_th - 0.05, 0.25)
+            return True, f"v_th={self.hidden.params.v_th:.2f}"
+        if action == "intrinsic_up":
+            self.intrinsic_beta = min(self.intrinsic_beta * 1.25, 1.0)
+            return True, f"intrinsic_beta={self.intrinsic_beta:.3f}"
+        if action == "intrinsic_down":
+            self.intrinsic_beta = max(self.intrinsic_beta * 0.75, 0.05)
+            return True, f"intrinsic_beta={self.intrinsic_beta:.3f}"
+        if action == "inner_up":
+            if self.inner_steps >= 30:
+                return False, None
+            self.inner_steps = min(self.inner_steps + 2, 30)
+            return True, f"inner_steps={self.inner_steps}"
+        if action == "inner_down":
+            if self.inner_steps <= 4:
+                return False, None
+            self.inner_steps = max(self.inner_steps - 2, 4)
+            return True, f"inner_steps={self.inner_steps}"
+        if action == "add_neuron":
+            for row in self.hidden.weights:
+                row.append(random.uniform(-0.2, 0.2))
+            self.hidden.bias.append(0.0)
+            for row in self.hidden.eligibility:
+                row.append(0.0)
+            self.hidden.bias_eligibility.append(0.0)
+            self.hidden.n_out += 1
+            self.hidden.reset_state()
+            self.readout_weights.append(
+                [random.uniform(-0.2, 0.2) for _ in range(4)]
+            )
+            return True, f"n_hidden={self.hidden.n_out}"
+        if action == "prune_neuron":
+            if self.hidden.n_out <= 8:
+                return False, None
+            idx = self.hidden.n_out - 1
+            for row in self.hidden.weights:
+                row.pop(idx)
+            self.hidden.bias.pop(idx)
+            for row in self.hidden.eligibility:
+                row.pop(idx)
+            self.hidden.bias_eligibility.pop(idx)
+            self.hidden.n_out -= 1
+            self.hidden.reset_state()
+            self.readout_weights.pop(idx)
+            return True, f"n_hidden={self.hidden.n_out}"
+        if action == "switch_surrogate":
+            if self.surrogate_name == "fast_sigmoid":
+                self.hidden.set_surrogate(triangular_surrogate)
+                self.surrogate_name = "triangular"
+            else:
+                self.hidden.set_surrogate(fast_sigmoid_surrogate)
+                self.surrogate_name = "fast_sigmoid"
+            return True, self.surrogate_name
+        if action == "patch_surrogate":
+            info = self.code_patcher.apply(self.hidden)
+            self.last_patch_info = info
+            self.surrogate_name = "code_patch"
+            return True, info
+        return False, None
 
 
 __all__ = ["SNNPolicy", "build_self_model_input"]

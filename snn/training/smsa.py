@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
 from envs.gridworld import GridWorld
+from meta.autoadapt import MetaLearner
 from snn.agents.smsa_policy import SNNPolicy, build_self_model_input
 from snn.lif import LIFParams
 from snn.selfmodel import SelfModel
@@ -105,7 +106,7 @@ def simulate_recovery(
 ) -> int:
     success_window: deque[int] = deque(maxlen=30)
     policy_alpha = 1.0
-    policy_beta = 0.4
+    policy_beta = 1.0
     meta_effect_span = 12
     meta_recent_steps = 0
     state_size = env_cfg.size * env_cfg.size
@@ -237,6 +238,12 @@ def train_smsa(
         hidden_size=28,
         lif_params=self_params,
     )
+    meta = MetaLearner(
+        window=20,
+        min_delta=0.05,
+        ab_episodes=5,
+        fallback_action="intrinsic_up",
+    )
     buffer = ReplayBuffer(capacity=3000)
 
     os.makedirs(output_dir, exist_ok=True)
@@ -247,6 +254,7 @@ def train_smsa(
             fieldnames=[
                 "episode",
                 "steps",
+                "episode_return",
                 "avg_nll",
                 "reward_mse",
                 "energy_mse",
@@ -256,7 +264,7 @@ def train_smsa(
         writer.writeheader()
 
     policy_alpha = 1.0
-    policy_beta = 0.4
+    policy_beta = 1.0
     meta_effect_span = 12
     meta_recent_steps = 0
 
@@ -265,6 +273,7 @@ def train_smsa(
     cause_history: List[float] = []
     success_window: deque[int] = deque(maxlen=20)
     running_return: float | None = None
+    return_history: List[float] = []
     forget_episode = episodes // 2
     forget_triggered = False
     baseline_recovery_episode: int | None = None
@@ -272,6 +281,67 @@ def train_smsa(
     actual_recovery_episode: int | None = None
     episodes_since_forget = 0
     recover_threshold = 0.9
+
+    def evaluate_for_meta(candidate: SNNPolicy, eval_seed: int) -> float:
+        rng_state = random.getstate()
+        random.seed(eval_seed)
+        total_return = 0.0
+        sm_copy = copy.deepcopy(self_model)
+        for idx in range(meta.ab_episodes):
+            env_seed = eval_seed * 1009 + idx * 53 + 7
+            eval_env = env_cfg.make_env(seed=env_seed)
+            obs_eval = eval_env.reset()
+            candidate.begin_episode()
+            state_idx = _obs_to_index(obs_eval)
+            visits = defaultdict(int)
+            steps_eval = 0
+            while steps_eval < env_cfg.max_steps:
+                policy_state = candidate.forward(state_idx)
+                action_eval = candidate.sample_action(policy_state.probs)
+                bonus_eval = candidate.intrinsic_bonus(visits[state_idx])
+                visits[state_idx] += 1
+                features = build_self_model_input(
+                    state_index=state_idx,
+                    action=action_eval,
+                    mean_count=policy_state.mean_rate,
+                    sum_count=policy_state.sum_rate,
+                    eta_e=candidate.hidden_lr,
+                    v_th=candidate.hidden.params.v_th,
+                    state_size=state_size,
+                )
+                sm_state = sm_copy.forward(features)
+                obs_eval, base_reward_eval, done_eval, _info = eval_env.step(action_eval)
+                reward_eval = base_reward_eval + bonus_eval
+                total_return += reward_eval
+                advantage_eval = reward_eval - candidate.baseline
+                next_idx = _obs_to_index(obs_eval)
+                energy_target_eval = min(
+                    sum(policy_state.hidden_counts)
+                    / float(candidate.inner_steps * candidate.hidden.n_out),
+                    1.0,
+                )
+                self_signal_eval = sm_copy.update(
+                    state=sm_state,
+                    next_obs_index=next_idx,
+                    reward_target=reward_eval,
+                    energy_target=energy_target_eval,
+                    cause_label=0,
+                )
+                candidate.update(
+                    policy_state,
+                    action_eval,
+                    advantage_eval,
+                    self_signal=self_signal_eval,
+                    alpha=policy_alpha,
+                    beta=policy_beta,
+                )
+                candidate.update_baseline(reward_eval)
+                state_idx = next_idx
+                steps_eval += 1
+                if done_eval:
+                    break
+        random.setstate(rng_state)
+        return total_return / float(max(meta.ab_episodes, 1))
 
     for episode in range(1, episodes + 1):
         obs = env.reset()
@@ -310,7 +380,7 @@ def train_smsa(
                 / float(policy.inner_steps * policy.hidden.n_out),
                 1.0,
             )
-            cause_label = 1 if info.get("goal_reached", False) else 0
+            cause_label = 1 if meta_recent_steps > 0 else 0
             self_signal = self_model.update(
                 state=self_state,
                 next_obs_index=next_index,
@@ -369,11 +439,12 @@ def train_smsa(
         else:
             running_return = 0.9 * running_return + 0.1 * episode_reward
         logger.info(
-            "Episode %03d return %.3f avg_nll %.3f cause_acc %.2f",
+            "Episode %03d return %.3f avg_nll %.3f cause_acc %.2f energy_mse %.3f",
             episode,
             running_return,
             avg_nll,
             cause_acc,
+            avg_energy_mse,
         )
         with open(csv_path, "a", newline="") as f_csv:
             writer = csv.DictWriter(
@@ -381,6 +452,7 @@ def train_smsa(
                 fieldnames=[
                     "episode",
                     "steps",
+                    "episode_return",
                     "avg_nll",
                     "reward_mse",
                     "energy_mse",
@@ -391,6 +463,7 @@ def train_smsa(
                 {
                     "episode": episode,
                     "steps": steps,
+                    "episode_return": episode_reward,
                     "avg_nll": avg_nll,
                     "reward_mse": avg_reward_mse,
                     "energy_mse": avg_energy_mse,
@@ -398,14 +471,32 @@ def train_smsa(
                 }
             )
 
+        if running_return is not None:
+            return_history.append(running_return)
+            if len(return_history) > meta.window:
+                return_history.pop(0)
+        if meta.should_trigger(return_history):
+            policy, meta_logs = meta.adapt(
+                policy,
+                step=episode,
+                evaluate_fn=evaluate_for_meta,
+            )
+            for meta_msg in meta_logs:
+                logger.info(meta_msg)
+            if any("accepted" in meta_msg for meta_msg in meta_logs):
+                meta_recent_steps = meta_effect_span
+            return_history.clear()
+
         if episode == forget_episode and not forget_triggered:
             recover_threshold = 0.9
             policy.reset_parameters()
+            meta_recent_steps = meta_effect_span
             visit_counts.clear()
             forget_triggered = True
             episodes_since_forget = 0
             success_window.clear()
             running_return = None
+            return_history.clear()
             buffer_snapshot = ReplayBuffer(capacity=buffer.capacity)
             buffer_snapshot.data.extend(buffer.data)
             baseline_agent = copy.deepcopy(policy)
@@ -497,9 +588,17 @@ def train_smsa(
         end_nll,
         cause_tail,
     )
+    meta_ratio = meta.positive_ratio()
+    logger.info(
+        "Meta adaptations: attempts=%d positive_ratio=%.2f",
+        meta.attempts,
+        meta_ratio,
+    )
     if validate:
         assert end_nll < start_nll, "Self-Model NLL 未下降。"
         assert cause_tail > 0.7, "自因分类准确率未超过 0.7。"
+        if meta.attempts > 0:
+            assert meta_ratio >= 0.5, "自改后 Δ 回报为正的比例未达到 50%。"
         if forget_triggered:
             if dream_recovery_episode is None:
                 raise AssertionError("梦想回放未能恢复至目标成功率。")
