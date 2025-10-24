@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import copy
-import csv
 import math
 import os
 import random
 from collections import defaultdict, deque
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
@@ -17,7 +17,7 @@ from snn.agents.smsa_policy import SNNPolicy, build_self_model_input
 from snn.lif import LIFParams
 from snn.selfmodel import SelfModel
 from snn.training.gridworld_meta import GridWorldConfig
-from tools.logger import get_logger
+from tools.logger import CsvLogger, get_logger
 from tools.replay import ReplayBuffer
 
 
@@ -247,21 +247,18 @@ def train_smsa(
     buffer = ReplayBuffer(capacity=3000)
 
     os.makedirs(output_dir, exist_ok=True)
-    csv_path = os.path.join(output_dir, "self_model_metrics.csv")
-    with open(csv_path, "w", newline="") as f_csv:
-        writer = csv.DictWriter(
-            f_csv,
-            fieldnames=[
-                "episode",
-                "steps",
-                "episode_return",
-                "avg_nll",
-                "reward_mse",
-                "energy_mse",
-                "cause_acc",
-            ],
-        )
-        writer.writeheader()
+    csv_path = Path(output_dir) / "self_model_metrics.csv"
+    fieldnames = [
+        "episode",
+        "return",
+        "success_rate",
+        "spikes",
+        "nll",
+        "cause_acc",
+        "meta_action",
+        "delta",
+        "reverted",
+    ]
 
     policy_alpha = 1.0
     policy_beta = 1.0
@@ -281,6 +278,28 @@ def train_smsa(
     actual_recovery_episode: int | None = None
     episodes_since_forget = 0
     recover_threshold = 0.9
+    last_meta = {"meta_action": "none", "delta": 0.0, "reverted": False}
+
+    def parse_meta(logs: List[str]) -> None:
+        nonlocal last_meta
+        if not logs:
+            last_meta = {"meta_action": "none", "delta": 0.0, "reverted": False}
+            return
+        message = logs[-1]
+        try:
+            action = message.split("action=")[1].split()[0]
+        except (IndexError, ValueError):
+            action = "unknown"
+        try:
+            delta_val = float(message.split("delta=")[1].split()[0])
+        except (IndexError, ValueError):
+            delta_val = 0.0
+        reverted = "reverted" in message
+        last_meta = {
+            "meta_action": action,
+            "delta": delta_val,
+            "reverted": reverted,
+        }
 
     def evaluate_for_meta(candidate: SNNPolicy, eval_seed: int) -> float:
         rng_state = random.getstate()
@@ -343,149 +362,151 @@ def train_smsa(
         random.setstate(rng_state)
         return total_return / float(max(meta.ab_episodes, 1))
 
-    for episode in range(1, episodes + 1):
-        obs = env.reset()
-        policy.begin_episode()
-        state_index = _obs_to_index(obs)
-        episode_reward = 0.0
-        episode_nll = 0.0
-        episode_reward_mse = 0.0
-        episode_energy_mse = 0.0
-        episode_cause_hits = 0
-        steps = 0
-        reached_goal = 0
+    with CsvLogger(csv_path, fieldnames) as csv_logger:
+        for episode in range(1, episodes + 1):
+            obs = env.reset()
+            policy.begin_episode()
+            state_index = _obs_to_index(obs)
+            episode_reward = 0.0
+            episode_nll = 0.0
+            episode_cause_hits = 0
+            episode_energy_mse = 0.0
+            steps = 0
+            reached_goal = 0
+            episode_spikes = 0.0
 
-        while steps < env_cfg.max_steps:
-            policy_state = policy.forward(state_index)
-            action = policy.sample_action(policy_state.probs)
-            visit_counts[state_index] += 1
-            bonus = policy.intrinsic_bonus(visit_counts[state_index])
-            features = build_self_model_input(
-                state_index=state_index,
-                action=action,
-                mean_count=policy_state.mean_rate,
-                sum_count=policy_state.sum_rate,
-                eta_e=policy.hidden_lr,
-                v_th=policy.hidden.params.v_th,
-                state_size=state_size,
-            )
-            self_state = self_model.forward(features)
-            obs, base_reward, done, info = env.step(action)
-            reward = base_reward + bonus
-            episode_reward += reward
-            advantage = reward - policy.baseline
-            next_index = _obs_to_index(obs)
-            energy_target = min(
-                sum(policy_state.hidden_counts)
-                / float(policy.inner_steps * policy.hidden.n_out),
-                1.0,
-            )
-            cause_label = 1 if meta_recent_steps > 0 else 0
-            self_signal = self_model.update(
-                state=self_state,
-                next_obs_index=next_index,
-                reward_target=reward,
-                energy_target=energy_target,
-                cause_label=cause_label,
-            )
-            policy.update(
-                policy_state,
-                action,
-                advantage,
-                self_signal=self_signal,
-                alpha=policy_alpha,
-                beta=policy_beta,
-            )
-            policy.update_baseline(reward)
-            if meta_recent_steps > 0:
-                meta_recent_steps -= 1
-            buffer.add(
-                state_index,
-                action,
-                policy_state.hidden_counts,
-                reward,
-                next_index,
+            while steps < env_cfg.max_steps:
+                policy_state = policy.forward(state_index)
+                action = policy.sample_action(policy_state.probs)
+                visit_counts[state_index] += 1
+                bonus = policy.intrinsic_bonus(visit_counts[state_index])
+                features = build_self_model_input(
+                    state_index=state_index,
+                    action=action,
+                    mean_count=policy_state.mean_rate,
+                    sum_count=policy_state.sum_rate,
+                    eta_e=policy.hidden_lr,
+                    v_th=policy.hidden.params.v_th,
+                    state_size=state_size,
+                )
+                self_state = self_model.forward(features)
+                obs, base_reward, done, info = env.step(action)
+                reward = base_reward + bonus
+                episode_reward += reward
+                advantage = reward - policy.baseline
+                next_index = _obs_to_index(obs)
+                energy_target = min(
+                    sum(policy_state.hidden_counts)
+                    / float(policy.inner_steps * policy.hidden.n_out),
+                    1.0,
+                )
+                cause_label = 1 if meta_recent_steps > 0 else 0
+                self_signal = self_model.update(
+                    state=self_state,
+                    next_obs_index=next_index,
+                    reward_target=reward,
+                    energy_target=energy_target,
+                    cause_label=cause_label,
+                )
+                policy.update(
+                    policy_state,
+                    action,
+                    advantage,
+                    self_signal=self_signal,
+                    alpha=policy_alpha,
+                    beta=policy_beta,
+                )
+                policy.update_baseline(reward)
+                if meta_recent_steps > 0:
+                    meta_recent_steps -= 1
+                buffer.add(
+                    state_index,
+                    action,
+                    policy_state.hidden_counts,
+                    reward,
+                    next_index,
+                )
+
+                nll = -math.log(max(self_state.probs_next[next_index], 1e-8))
+                energy_mse = (self_state.pred_energy - energy_target) ** 2
+                cause_pred = (
+                    1 if self_state.probs_cause[1] >= self_state.probs_cause[0] else 0
+                )
+                cause_hit = 1 if cause_pred == cause_label else 0
+
+                episode_nll += nll
+                episode_energy_mse += energy_mse
+                episode_cause_hits += cause_hit
+                episode_spikes += sum(policy_state.hidden_counts)
+
+                state_index = next_index
+                steps += 1
+                if done:
+                    if info.get("goal_reached", False):
+                        reached_goal = 1
+                    break
+
+            success_window.append(reached_goal)
+            avg_nll = episode_nll / float(max(steps, 1))
+            avg_energy_mse = episode_energy_mse / float(max(steps, 1))
+            cause_acc = episode_cause_hits / float(max(steps, 1))
+            nll_history.append(avg_nll)
+            cause_history.append(cause_acc)
+            if running_return is None:
+                running_return = episode_reward
+            else:
+                running_return = 0.9 * running_return + 0.1 * episode_reward
+
+            return_history.append(episode_reward)
+
+            meta_logs: List[str] = []
+            if meta.should_trigger(return_history):
+                policy, meta_logs = meta.adapt(
+                    policy,
+                    step=episode,
+                    evaluate_fn=evaluate_for_meta,
+                )
+                for meta_msg in meta_logs:
+                    logger.info(meta_msg)
+                if any("accepted" in msg for msg in meta_logs):
+                    meta_recent_steps = meta_effect_span
+                return_history.clear()
+                return_history.append(episode_reward)
+            parse_meta(meta_logs)
+
+            success_rate = (
+                sum(success_window) / float(len(success_window))
+                if success_window
+                else 0.0
             )
 
-            nll = -math.log(max(self_state.probs_next[next_index], 1e-8))
-            reward_mse = (self_state.pred_reward - reward) ** 2
-            energy_mse = (self_state.pred_energy - energy_target) ** 2
-            cause_pred = (
-                1 if self_state.probs_cause[1] >= self_state.probs_cause[0] else 0
-            )
-            cause_hit = 1 if cause_pred == cause_label else 0
+            if episode % 10 == 0:
+                logger.info(
+                    "Episode %03d return %.3f success_rate %.2f spikes %.1f nll %.3f cause_acc %.2f meta=%s delta=%.3f reverted=%s",
+                    episode,
+                    episode_reward,
+                    success_rate,
+                    episode_spikes,
+                    avg_nll,
+                    cause_acc,
+                    last_meta["meta_action"],
+                    last_meta["delta"],
+                    last_meta["reverted"],
+                )
 
-            episode_nll += nll
-            episode_reward_mse += reward_mse
-            episode_energy_mse += energy_mse
-            episode_cause_hits += cause_hit
-
-            state_index = next_index
-            steps += 1
-            if done:
-                if info.get("goal_reached", False):
-                    reached_goal = 1
-                break
-
-        success_window.append(reached_goal)
-        avg_nll = episode_nll / float(max(steps, 1))
-        avg_reward_mse = episode_reward_mse / float(max(steps, 1))
-        avg_energy_mse = episode_energy_mse / float(max(steps, 1))
-        cause_acc = episode_cause_hits / float(max(steps, 1))
-        nll_history.append(avg_nll)
-        cause_history.append(cause_acc)
-        if running_return is None:
-            running_return = episode_reward
-        else:
-            running_return = 0.9 * running_return + 0.1 * episode_reward
-        logger.info(
-            "Episode %03d return %.3f avg_nll %.3f cause_acc %.2f energy_mse %.3f",
-            episode,
-            running_return,
-            avg_nll,
-            cause_acc,
-            avg_energy_mse,
-        )
-        with open(csv_path, "a", newline="") as f_csv:
-            writer = csv.DictWriter(
-                f_csv,
-                fieldnames=[
-                    "episode",
-                    "steps",
-                    "episode_return",
-                    "avg_nll",
-                    "reward_mse",
-                    "energy_mse",
-                    "cause_acc",
-                ],
-            )
-            writer.writerow(
+            csv_logger.log(
                 {
                     "episode": episode,
-                    "steps": steps,
-                    "episode_return": episode_reward,
-                    "avg_nll": avg_nll,
-                    "reward_mse": avg_reward_mse,
-                    "energy_mse": avg_energy_mse,
+                    "return": episode_reward,
+                    "success_rate": success_rate,
+                    "spikes": episode_spikes,
+                    "nll": avg_nll,
                     "cause_acc": cause_acc,
+                    "meta_action": last_meta["meta_action"],
+                    "delta": last_meta["delta"],
+                    "reverted": last_meta["reverted"],
                 }
             )
-
-        if running_return is not None:
-            return_history.append(running_return)
-            if len(return_history) > meta.window:
-                return_history.pop(0)
-        if meta.should_trigger(return_history):
-            policy, meta_logs = meta.adapt(
-                policy,
-                step=episode,
-                evaluate_fn=evaluate_for_meta,
-            )
-            for meta_msg in meta_logs:
-                logger.info(meta_msg)
-            if any("accepted" in meta_msg for meta_msg in meta_logs):
-                meta_recent_steps = meta_effect_span
-            return_history.clear()
 
         if episode == forget_episode and not forget_triggered:
             recover_threshold = 0.9

@@ -20,7 +20,7 @@ from meta.autoadapt import MetaLearner
 from snn.dense import DenseLIF
 from snn.lif import LIFParams, fast_sigmoid_surrogate, triangular_surrogate
 from snn.policy import PolicyHead
-from tools.logger import get_logger, setup_logging
+from tools.logger import CsvLogger, get_logger, setup_logging
 
 
 def patched_surrogate(u: float, slope: float = 1.5) -> float:
@@ -191,13 +191,14 @@ def _run_episode(
     visit_counts: DefaultDict[int, int],
     *,
     training: bool,
-) -> Tuple[float, bool]:
+) -> Tuple[float, bool, float]:
     obs = env.reset()
     agent.begin_episode()
     total_reward = 0.0
     goal_reached = False
     steps = 0
     done = False
+    spike_sum = 0.0
     while not done and steps < env.max_steps:
         counts = agent._integrate_counts(obs)
         probs = agent.policy.softmax(agent.policy.logits(counts))
@@ -208,13 +209,14 @@ def _run_episode(
         next_obs, base_reward, done, info = env.step(action)
         reward = base_reward + bonus
         total_reward += reward
+        spike_sum += sum(counts) * agent.inner_steps
         if training:
             agent.learn(counts, probs, action, reward)
         if info.get("goal_reached", False):
             goal_reached = True
         obs = next_obs
         steps += 1
-    return total_reward, goal_reached
+    return total_reward, goal_reached, spike_sum
 
 
 def _evaluate_agent(
@@ -231,7 +233,7 @@ def _evaluate_agent(
         env = env_cfg.make_env(seed=env_seed)
         agent.reseed(rng.randrange(1_000_000))
         visits: DefaultDict[int, int] = collections.defaultdict(int)
-        reward, _ = _run_episode(agent, env, visits, training=False)
+        reward, _success, _spikes = _run_episode(agent, env, visits, training=False)
         score += reward
     return score / float(max(episodes, 1))
 
@@ -253,6 +255,19 @@ def train_gridworld(
     rolling_returns: collections.deque[float] = collections.deque(maxlen=10)
     rolling_success: collections.deque[int] = collections.deque(maxlen=10)
     success_history: List[int] = []
+    csv_path = pathlib.Path("runs/gridworld_metrics.csv")
+    fieldnames = [
+        "episode",
+        "return",
+        "success_rate",
+        "spikes",
+        "nll",
+        "cause_acc",
+        "meta_action",
+        "delta",
+        "reverted",
+    ]
+    last_meta = {"meta_action": "none", "delta": 0.0, "reverted": False}
 
     def evaluate_fn(candidate: EpropGridAgent, eval_seed: int) -> float:
         return _evaluate_agent(
@@ -262,32 +277,88 @@ def train_gridworld(
             seed=eval_seed,
         )
 
-    for episode in range(1, episodes + 1):
-        env_seed = (seed or 0) * 1009 + episode * 47 + 17
-        env = env_cfg.make_env(seed=env_seed)
-        agent.reseed(env_seed)
-        reward, success = _run_episode(agent, env, visit_counts, training=True)
-        return_history.append(reward)
-        all_returns.append(reward)
-        rolling_returns.append(reward)
-        rolling_success.append(1 if success else 0)
-        success_history.append(1 if success else 0)
+    def parse_meta(logs: List[str]) -> None:
+        nonlocal last_meta
+        if not logs:
+            last_meta = {"meta_action": "none", "delta": 0.0, "reverted": False}
+            return
+        message = logs[-1]
+        try:
+            action = message.split("action=")[1].split()[0]
+        except (IndexError, ValueError):
+            action = "unknown"
+        try:
+            delta_str = message.split("delta=")[1].split()[0]
+            delta_val = float(delta_str)
+        except (IndexError, ValueError):
+            delta_val = 0.0
+        reverted = "reverted" in message
+        last_meta = {
+            "meta_action": action,
+            "delta": delta_val,
+            "reverted": reverted,
+        }
 
-        if episode % 10 == 0:
-            avg_return = sum(rolling_returns) / float(len(rolling_returns))
-            avg_success = sum(rolling_success) / float(len(rolling_success))
-            logger.info(
-                "Episode %03d avg_return %.3f success_rate %.2f",
-                episode,
-                avg_return,
-                avg_success,
+    with CsvLogger(csv_path, fieldnames) as csv_logger:
+        for episode in range(1, episodes + 1):
+            env_seed = (seed or 0) * 1009 + episode * 47 + 17
+            env = env_cfg.make_env(seed=env_seed)
+            agent.reseed(env_seed)
+            reward, success, spikes = _run_episode(
+                agent,
+                env,
+                visit_counts,
+                training=True,
+            )
+            return_history.append(reward)
+            all_returns.append(reward)
+            rolling_returns.append(reward)
+            rolling_success.append(1 if success else 0)
+            success_history.append(1 if success else 0)
+
+            meta_logs: List[str] = []
+            if meta.should_trigger(return_history):
+                agent, meta_logs = meta.adapt(
+                    agent,
+                    step=episode,
+                    evaluate_fn=evaluate_fn,
+                )
+                for log_line in meta_logs:
+                    logger.info(log_line)
+                return_history.clear()
+            parse_meta(meta_logs)
+
+            success_rate = (
+                sum(rolling_success) / float(len(rolling_success))
+                if rolling_success
+                else 0.0
             )
 
-        if meta.should_trigger(return_history):
-            agent, meta_logs = meta.adapt(agent, step=episode, evaluate_fn=evaluate_fn)
-            for log_line in meta_logs:
-                logger.info(log_line)
-            return_history.clear()
+            if episode % 10 == 0:
+                logger.info(
+                    "Episode %03d return %.3f success_rate %.2f spikes %.1f meta=%s delta=%.3f reverted=%s",
+                    episode,
+                    reward,
+                    success_rate,
+                    spikes,
+                    last_meta["meta_action"],
+                    last_meta["delta"],
+                    last_meta["reverted"],
+                )
+
+            csv_logger.log(
+                {
+                    "episode": episode,
+                    "return": reward,
+                    "success_rate": success_rate,
+                    "spikes": spikes,
+                    "nll": 0.0,
+                    "cause_acc": 0.0,
+                    "meta_action": last_meta["meta_action"],
+                    "delta": last_meta["delta"],
+                    "reverted": last_meta["reverted"],
+                }
+            )
 
     window = min(20, len(success_history))
     final_success = sum(success_history[-window:]) / float(max(window, 1))
