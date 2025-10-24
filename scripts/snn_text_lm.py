@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import argparse
 import collections
+import copy
 import gzip
-import io
+import glob
 import math
 import os
 import random
 import sys
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
+from typing import Deque, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 # Ensure repository root on path for imports.
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -21,10 +22,22 @@ if ROOT not in sys.path:
 
 from snn.dense import DenseLIF, LinearTemporalUnit
 from snn.lif import LIFParams, fast_sigmoid_surrogate
+from snn.selfmodel import SelfModel
 
 TOKEN_BOS = "<bos>"
 TOKEN_EOS = "<eos>"
 TOKEN_UNK = "<unk>"
+
+
+def expand_inputs(patterns: Sequence[str]) -> List[str]:
+    resolved: List[str] = []
+    for pattern in patterns:
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            resolved.extend(matches)
+        else:
+            resolved.append(pattern)
+    return resolved
 
 
 def open_stream(path: str) -> Iterator[str]:
@@ -39,7 +52,9 @@ def open_stream(path: str) -> Iterator[str]:
 
 
 def tokenize(line: str) -> List[str]:
-    return line.strip().split()
+    if not line:
+        return []
+    return list(line)
 
 
 @dataclass
@@ -96,11 +111,12 @@ class HashProjector:
 
 @dataclass
 class FileState:
+    label: str
     tokens: List[List[str]]
     pointer: int = 0
     counts: int = 0
     total_delta: float = 0.0
-    history: collections.deque = None  # type: ignore[assignment]
+    history: Optional[Deque[float]] = None
     last_ppl: float = float("inf")
 
     def __post_init__(self) -> None:
@@ -112,7 +128,8 @@ class FileState:
         if self.counts > 0 and math.isfinite(self.last_ppl):
             delta = self.last_ppl - ppl
             self.total_delta += delta
-            self.history.append(delta)
+            if self.history is not None:
+                self.history.append(delta)
         self.counts += 1
         self.last_ppl = ppl
         return delta
@@ -122,17 +139,23 @@ class FileState:
             return 0.0
         return self.total_delta / float(self.counts)
 
+    def recent_delta(self) -> float:
+        if not self.history:
+            return 0.0
+        return sum(self.history) / float(len(self.history))
+
 
 class FileScheduler:
     def __init__(
         self,
-        files_tokens: List[List[List[str]]],
+        corpora: Sequence[Tuple[str, List[List[str]]]],
         batch_lines: int,
         ucb_c: float = 0.4,
     ) -> None:
-        self.states: List[FileState] = [
-            FileState(tokens=toks) for toks in files_tokens if toks
-        ]
+        self.states: List[FileState] = []
+        for label, tokens in corpora:
+            if tokens:
+                self.states.append(FileState(label=label, tokens=tokens))
         if not self.states:
             raise ValueError("No non-empty files available.")
         self.batch_lines = batch_lines
@@ -147,7 +170,7 @@ class FileScheduler:
         best_idx = 0
         best_score = -float("inf")
         for idx, state in enumerate(self.states):
-            mean = state.mean_delta()
+            mean = state.recent_delta()
             bonus = self.ucb_c * math.sqrt(
                 2.0 * math.log(total + 1) / max(1, state.counts)
             )
@@ -193,6 +216,20 @@ class FileScheduler:
     def set_pointer(self, file_idx: int, pointer: int) -> None:
         self.states[file_idx].pointer = pointer
 
+    def label_for(self, file_idx: int) -> str:
+        return self.states[file_idx].label
+
+    def summaries(self) -> List[str]:
+        summary: List[str] = []
+        for state in self.states:
+            if not state.history:
+                continue
+            summary.append(f"{state.label}:{state.recent_delta():+.3f}")
+        return summary
+
+    def recent_delta(self, file_idx: int) -> float:
+        return self.states[file_idx].recent_delta()
+
 
 class PlateauDetector:
     def __init__(self, window: int, min_delta: float, cooldown: int) -> None:
@@ -215,6 +252,201 @@ class PlateauDetector:
             self.cooldown_timer = self.cooldown
             return True
         return False
+
+
+class ReplayBuffer:
+    def __init__(self, capacity: int, rng: random.Random) -> None:
+        self.capacity = capacity
+        self.rng = rng
+        self._data: Deque[Tuple[str, ...]] = collections.deque(maxlen=capacity)
+
+    def add(self, sequence: Sequence[str]) -> None:
+        if not sequence:
+            return
+        self._data.append(tuple(sequence))
+
+    def sample(self, count: int) -> List[List[str]]:
+        if count <= 0 or not self._data:
+            return []
+        count = min(count, len(self._data))
+        data_list = list(self._data)
+        indices = self.rng.sample(range(len(data_list)), count)
+        return [list(data_list[idx]) for idx in indices]
+
+    def random_choice(self) -> Optional[List[str]]:
+        if not self._data:
+            return None
+        data_list = list(self._data)
+        return list(self.rng.choice(data_list))
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+class DreamSelfModel:
+    def __init__(
+        self,
+        vocab_size: int,
+        bos_id: int,
+        eos_id: int,
+        *,
+        hidden_size: int = 64,
+        inner_steps: int = 12,
+        seed: int = 0,
+    ) -> None:
+        params = LIFParams(v_th=0.5, tau_m=8.5, tau_a=17.0, beta=0.35, refractory=2)
+        self.model = SelfModel(
+            obs_dim=vocab_size,
+            action_dim=0,
+            hidden_size=hidden_size,
+            lif_params=params,
+            inner_steps=inner_steps,
+            hidden_lr=0.08,
+            readout_lr=0.15,
+            clip=1.5,
+            obs_weight=1.0,
+            reward_weight=0.01,
+            energy_weight=0.01,
+            cause_weight=0.01,
+        )
+        self.vocab_size = vocab_size
+        self.bos_id = bos_id
+        self.eos_id = eos_id
+        self.extra_features = [0.0, 0.0, 0.0, 0.0]
+        self.rng = random.Random(seed)
+
+    def _features(self, token_id: int) -> List[float]:
+        features = [0.0 for _ in range(self.vocab_size)]
+        if 0 <= token_id < self.vocab_size:
+            features[token_id] = 1.0
+        return features + self.extra_features
+
+    def update_pair(self, prev_id: int, next_id: int) -> None:
+        features = self._features(prev_id)
+        state = self.model.forward(features)
+        self.model.update(
+            state=state,
+            next_obs_index=max(0, min(next_id, self.vocab_size - 1)),
+            reward_target=0.0,
+            energy_target=0.0,
+            cause_label=0,
+        )
+
+    def dream_sequence(self, start_id: int, max_steps: int) -> List[int]:
+        prev = start_id
+        sequence: List[int] = []
+        for _ in range(max_steps):
+            features = self._features(prev)
+            state = self.model.forward(features)
+            next_id = self._sample(state.probs_next)
+            if next_id == self.eos_id:
+                break
+            if next_id == self.bos_id:
+                prev = next_id
+                continue
+            sequence.append(next_id)
+            prev = next_id
+        return sequence
+
+    def _sample(self, probs: Sequence[float]) -> int:
+        if not probs:
+            return self.rng.randrange(self.vocab_size)
+        total = sum(probs)
+        if total <= 0.0 or not math.isfinite(total):
+            return self.rng.randrange(self.vocab_size)
+        target = self.rng.random()
+        accum = 0.0
+        for idx, prob in enumerate(probs):
+            accum += prob / total
+            if target <= accum:
+                return idx
+        return len(probs) - 1
+
+
+class DreamHelper:
+    def __init__(
+        self,
+        vocab: Vocab,
+        *,
+        capacity: int,
+        replay_ratio: float,
+        dream_ratio: float,
+        min_fill: int,
+        min_len: int,
+        max_len: int,
+        seed: int,
+    ) -> None:
+        self.vocab = vocab
+        self.replay_ratio = max(0.0, replay_ratio)
+        self.dream_ratio = max(0.0, dream_ratio)
+        self.min_fill = max(1, min_fill)
+        self.min_len = max(1, min_len)
+        self.max_len = max(self.min_len, max_len)
+        self.bos_id = vocab.encode(TOKEN_BOS)
+        self.eos_id = vocab.encode(TOKEN_EOS)
+        self.buffer_rng = random.Random(seed)
+        self.buffer = ReplayBuffer(capacity, self.buffer_rng)
+        self.model = DreamSelfModel(
+            vocab_size=len(vocab.id_to_token),
+            bos_id=self.bos_id,
+            eos_id=self.eos_id,
+            seed=seed + 1,
+        )
+
+    def augment(self, sequences: List[List[str]]) -> List[List[str]]:
+        if not sequences:
+            return []
+        augmented = [list(seq) for seq in sequences]
+        for seq in sequences:
+            self._update_model_for_sequence(seq)
+            if seq:
+                self.buffer.add(seq)
+        if len(self.buffer) < self.min_fill:
+            return augmented
+
+        extras: List[List[str]] = []
+        if self.replay_ratio > 0.0:
+            num_replay = max(1, int(round(len(sequences) * self.replay_ratio)))
+            extras.extend(self.buffer.sample(num_replay))
+        if self.dream_ratio > 0.0:
+            num_dream = max(1, int(round(len(sequences) * self.dream_ratio)))
+            extras.extend(self._dream_samples(num_dream))
+
+        augmented.extend([seq for seq in extras if seq])
+        return augmented
+
+    def _update_model_for_sequence(self, tokens: Sequence[str]) -> None:
+        prev_id = self.bos_id
+        if tokens:
+            for token in tokens:
+                token_id = self.vocab.encode(token)
+                self.model.update_pair(prev_id, token_id)
+                prev_id = token_id
+        self.model.update_pair(prev_id, self.eos_id)
+
+    def _dream_samples(self, count: int) -> List[List[str]]:
+        samples: List[List[str]] = []
+        for _ in range(count):
+            seed_seq = self.buffer.random_choice()
+            if seed_seq is None:
+                break
+            start_token = TOKEN_BOS
+            if seed_seq:
+                choices = [TOKEN_BOS] + seed_seq
+                start_token = self.buffer_rng.choice(choices)
+            start_id = self.vocab.encode(start_token)
+            length = self.buffer_rng.randint(self.min_len, self.max_len)
+            token_ids = self.model.dream_sequence(start_id, length)
+            if not token_ids:
+                continue
+            tokens = [
+                self.vocab.id_to_token[token_id]
+                for token_id in token_ids
+                if token_id not in (self.bos_id, self.eos_id)
+            ]
+            if tokens:
+                samples.append(tokens)
+        return samples
 
 
 def apply_action(model: TextSNNLM, action: str) -> Tuple[bool, str | None]:
@@ -274,12 +506,16 @@ def run_batches(
     vocab: Vocab,
     batches: Sequence[Sequence[List[str]]],
     train: bool,
+    dream_helper: Optional[DreamHelper] = None,
 ) -> Tuple[float, float, List[float], int]:
     total_loss = 0.0
     total_tokens = 0
     batch_ppls: List[float] = []
     for sequences in batches:
-        loss, tokens = run_batch_sequences(model, vocab, list(sequences), train=train)
+        seq_list = [list(seq) for seq in sequences]
+        if dream_helper is not None and train:
+            seq_list = dream_helper.augment(seq_list)
+        loss, tokens = run_batch_sequences(model, vocab, seq_list, train=train)
         total_loss += loss
         total_tokens += tokens
         avg_loss = loss / float(max(1, tokens))
@@ -299,7 +535,6 @@ def adapt_parameters(
     step: int,
 ) -> Tuple[TextSNNLM, bool, List[str], int, float]:
     messages: List[str] = []
-    baseline_model = copy.deepcopy(model)
     _, base_ppl, _, _ = run_batches(copy.deepcopy(model), vocab, batches, train=False)
     actions = [
         "eta_up",
@@ -474,28 +709,36 @@ class TextSNNLM:
         return loss
 
 
-def build_corpora(paths: Sequence[str]) -> List[List[List[str]]]:
-    corpora: List[List[List[str]]] = []
+def build_corpora(paths: Sequence[str]) -> List[Tuple[str, List[List[str]]]]:
+    corpora: List[Tuple[str, List[List[str]]]] = []
     for path in paths:
         tokens_list: List[List[str]] = []
-        for line in open_stream(path):
-            tokens = tokenize(line)
-            if tokens:
-                tokens_list.append(tokens)
+        try:
+            for line in open_stream(path):
+                tokens = tokenize(line)
+                if tokens:
+                    tokens_list.append(tokens)
+        except OSError as exc:
+            print(f"[warn] skip {path}: {exc}", file=sys.stderr)
+            continue
         if tokens_list:
-            corpora.append(tokens_list)
+            label = os.path.basename(path)
+            corpora.append((label, tokens_list))
     return corpora
 
 
 def train(args: argparse.Namespace) -> None:
-    corpora = build_corpora(args.inputs)
+    input_paths = expand_inputs(args.inputs)
+    corpora = build_corpora(input_paths)
     if not corpora:
         print("No usable lines found.", file=sys.stderr)
         return
 
-    flattened = [tokens for corpus in corpora for tokens in corpus]
+    flattened = [tokens for _, corpus in corpora for tokens in corpus]
     vocab = Vocab.build(flattened, max_size=args.vocab)
     vocab_size = len(vocab.id_to_token)
+
+    random.seed(args.seed)
 
     scheduler = FileScheduler(corpora, batch_lines=args.batch_lines, ucb_c=args.ucb_c)
     model = TextSNNLM(
@@ -516,7 +759,18 @@ def train(args: argparse.Namespace) -> None:
         cooldown=args.plateau_cooldown,
     )
 
-    random.seed(args.seed)
+    dream_helper: Optional[DreamHelper] = None
+    if args.replay_ratio > 0.0 or args.dream_ratio > 0.0:
+        dream_helper = DreamHelper(
+            vocab=vocab,
+            capacity=max(args.replay_capacity, args.batch_lines),
+            replay_ratio=max(0.0, args.replay_ratio),
+            dream_ratio=max(0.0, args.dream_ratio),
+            min_fill=max(args.replay_warmup, args.batch_lines),
+            min_len=args.dream_min_len,
+            max_len=args.dream_max_len,
+            seed=args.seed + 17,
+        )
 
     total_tokens = 0
     total_batches = 0
@@ -540,7 +794,7 @@ def train(args: argparse.Namespace) -> None:
             continue
 
         avg_loss, avg_ppl, batch_ppls, tokens = run_batches(
-            model, vocab, batches, train=True
+            model, vocab, batches, train=True, dream_helper=dream_helper
         )
         scheduler.set_pointer(file_idx, pointer_after)
         scheduler.total_batches += 1
@@ -557,12 +811,18 @@ def train(args: argparse.Namespace) -> None:
             report_loss = loss_since_report / float(max(1, tokens_since_report))
             report_ppl = math.exp(min(20.0, report_loss))
             print(
-                f"[train] batches={total_batches} tokens={total_tokens} ppl={report_ppl:.2f}"
+                f"[train] batches={total_batches} tokens={total_tokens} loss/token={report_loss:.4f} ppl={report_ppl:.2f}"
             )
+            domain_summary = scheduler.summaries()
+            if domain_summary:
+                print("[meta] recent Δppl " + " ".join(domain_summary))
             tokens_since_report = 0
             loss_since_report = 0.0
 
         if detector.update(delta):
+            print(
+                f"[meta] plateau file={scheduler.label_for(file_idx)} recentΔ={scheduler.recent_delta(file_idx):+.4f}"
+            )
             preview_batches, pointer_preview = scheduler.fetch_batches(
                 file_idx, args.adapt_batches, advance=False
             )
@@ -585,12 +845,16 @@ def train(args: argparse.Namespace) -> None:
                 total_loss_contrib = adapt_loss * adapt_tokens
                 loss_since_report += total_loss_contrib
                 cumulative_loss += total_loss_contrib
+                cumulative_tokens += adapt_tokens
                 if tokens_since_report >= args.report_every:
                     report_loss = loss_since_report / float(max(1, tokens_since_report))
                     report_ppl = math.exp(min(20.0, report_loss))
                     print(
-                        f"[train] batches={total_batches} tokens={total_tokens} ppl={report_ppl:.2f}"
+                        f"[train] batches={total_batches} tokens={total_tokens} loss/token={report_loss:.4f} ppl={report_ppl:.2f}"
                     )
+                    domain_summary = scheduler.summaries()
+                    if domain_summary:
+                        print("[meta] recent Δppl " + " ".join(domain_summary))
                     tokens_since_report = 0
                     loss_since_report = 0.0
                 continue
@@ -598,7 +862,7 @@ def train(args: argparse.Namespace) -> None:
     overall_loss = cumulative_loss / float(max(1, cumulative_tokens))
     overall_ppl = math.exp(min(20.0, overall_loss)) if cumulative_tokens else 0.0
     print(
-        f"[final] batches={total_batches} tokens={total_tokens} ppl={overall_ppl:.2f}"
+        f"[final] batches={total_batches} tokens={total_tokens} loss/token={overall_loss:.4f} ppl={overall_ppl:.2f}"
     )
 
 
@@ -624,6 +888,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--plateau-delta", type=float, default=0.02, help="Minimum cumulative Δppl to avoid plateau.")
     parser.add_argument("--plateau-cooldown", type=int, default=40, help="Cooldown batches after a plateau adaption.")
     parser.add_argument("--adapt-batches", type=int, default=5, help="Number of batches for A/B adaptation.")
+    parser.add_argument("--replay-capacity", type=int, default=2048, help="Replay buffer capacity.")
+    parser.add_argument("--replay-ratio", type=float, default=0.3, help="Replay sequences per batch ratio.")
+    parser.add_argument("--dream-ratio", type=float, default=0.2, help="Dream sequences per batch ratio.")
+    parser.add_argument("--dream-min-len", type=int, default=3, help="Minimum dream sequence length.")
+    parser.add_argument("--dream-max-len", type=int, default=5, help="Maximum dream sequence length.")
+    parser.add_argument("--replay-warmup", type=int, default=64, help="Minimum sequences before enabling replay/dream.")
     return parser.parse_args(argv)
 
 
