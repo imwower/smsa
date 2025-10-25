@@ -23,9 +23,11 @@ class CodePatcher:
     ]
 
     def __init__(self, expressions: Sequence[str] | None = None) -> None:
-        self.expressions = list(expressions) if expressions else list(self.DEFAULT_EXPRESSIONS)
+        self.expressions = (
+            list(expressions) if expressions else list(self.DEFAULT_EXPRESSIONS)
+        )
         if not self.expressions:
-            raise ValueError("必须提供至少一个代码表达式。")
+            raise ValueError("必须提供至少一个替代导数表达式。")
         self.current_idx = -1
         self._validate_all()
 
@@ -64,6 +66,7 @@ class CodePatcher:
         layer.set_surrogate(func)
         return f"patch surrogate expr={expression}"
 
+
 @dataclass
 class AdaptationLog:
     """记录一次候选改动的结果。"""
@@ -77,90 +80,133 @@ class AdaptationLog:
 
     def format(self) -> str:
         status = "reverted" if self.reverted else "accepted"
-        suffix = f", info={self.info}" if self.info else ""
+        suffix = f" info={self.info}" if self.info else ""
         return (
-            f"[meta] step {self.step:03d} action={self.action} "
-            f"delta={self.delta:.3f} ({status}, pos_ratio={self.positive_ratio:.2f}"
-            f"{suffix})"
+            f"[meta] ep{self.step:03d} action={self.action} "
+            f"delta={self.delta:.3f} ({status}, pos={self.positive_ratio:.2f}){suffix}"
         )
 
 
 class MetaLearner:
     """使用 UCB 选择自改动作，并通过 A/B 测试验证。"""
 
+    DEFAULT_ACTIONS = [
+        "eta_up",
+        "eta_down",
+        "vth_up",
+        "vth_down",
+        "intrinsic_up",
+        "intrinsic_down",
+        "inner_up",
+        "inner_down",
+        "switch_surrogate",
+        "patch_surrogate",
+    ]
+
     def __init__(
         self,
         *,
-        window: int = 20,
-        min_delta: float = 0.05,
+        plateau_window: int = 20,
+        plateau_min_delta: float = 0.05,
+        window: int | None = None,
+        min_delta: float | None = None,
         ucb_c: float = 0.6,
-        ab_episodes: int = 5,
+        ab_rounds: int = 5,
+        ab_episodes: int | None = None,
+        actions: Sequence[str] | None = None,
         candidates: Sequence[str] | None = None,
         fallback_action: str | None = None,
+        seed: int | None = None,
     ) -> None:
-        self.window = window
-        self.min_delta = min_delta
+        if window is not None:
+            plateau_window = window
+        if min_delta is not None:
+            plateau_min_delta = min_delta
+        if ab_episodes is not None:
+            ab_rounds = ab_episodes
+        if plateau_window <= 0:
+            raise ValueError("plateau_window 需为正整数。")
+        if plateau_min_delta < 0:
+            raise ValueError("plateau_min_delta 需为非负数。")
+        if ab_rounds <= 0:
+            raise ValueError("ab_rounds 需为正整数。")
+
+        self.window = plateau_window
+        self.min_delta = plateau_min_delta
         self.ucb_c = ucb_c
-        self.ab_episodes = ab_episodes
-        default_candidates = [
-            "eta_up",
-            "eta_down",
-            "vth_up",
-            "vth_down",
-            "intrinsic_up",
-            "intrinsic_down",
-            "inner_up",
-            "inner_down",
-            "add_neuron",
-            "prune_neuron",
-            "switch_surrogate",
-            "patch_surrogate",
-        ]
-        self.candidates: List[str] = list(candidates) if candidates else default_candidates
-        self.counts: Dict[str, int] = {c: 0 for c in self.candidates}
-        self.totals: Dict[str, float] = {c: 0.0 for c in self.candidates}
+        self.ab_rounds = ab_rounds
+        self.ab_episodes = ab_rounds
+        action_list: List[str] = []
+        if actions is not None:
+            action_list = list(actions)
+        elif candidates is not None:
+            action_list = list(candidates)
+        else:
+            action_list = list(self.DEFAULT_ACTIONS)
+        self.fallback_action = fallback_action
+        if self.fallback_action and self.fallback_action not in action_list:
+            action_list.append(self.fallback_action)
+        self.actions = action_list
+        if not self.actions:
+            raise ValueError("必须提供至少一个自改动作。")
+
+        self.counts: Dict[str, int] = {action: 0 for action in self.actions}
+        self.totals: Dict[str, float] = {action: 0.0 for action in self.actions}
         self.attempts = 0
         self._positives = 0
-        self._seed_base = 1337
-        self._rng = random.Random(2024)
-        self.fallback_action = fallback_action
-        if (
-            self.fallback_action
-            and self.fallback_action not in self.counts
-        ):
-            self.counts[self.fallback_action] = 0
-            self.totals[self.fallback_action] = 0.0
+        self._seed_base = 2027
+        self._rng = random.Random(seed)
 
     def should_trigger(self, history: Sequence[float]) -> bool:
-        """判断是否进入平台期。"""
+        """判断最近窗口是否进入平台期。"""
         if len(history) < self.window:
             return False
-        window_values = history[-self.window :]
-        return (max(window_values) - min(window_values)) < self.min_delta
+        recent = history[-self.window :]
+        return (max(recent) - min(recent)) < self.min_delta
+
+    def positive_ratio(self) -> float:
+        if self.attempts == 0:
+            return 0.0
+        return self._positives / float(self.attempts)
 
     def select_candidate(self) -> str:
-        """使用 UCB 对候选改动进行选择。"""
-        exploration = sum(max(1, self.counts[c]) for c in self.candidates) + 1
+        """根据 UCB 估计选择一个动作。"""
+        total_trials = sum(max(1, self.counts[a]) for a in self.actions) + 1
+        best_action = self.actions[0]
         best_score = -float("inf")
-        best_candidate = self.candidates[0]
-        for action in self.candidates:
-            trials = max(1, self.counts[action])
-            mean = self.totals[action] / trials if self.counts[action] > 0 else 0.0
-            bonus = math.sqrt(2.0 * math.log(exploration) / trials)
+        for action in self.actions:
+            trials = self.counts[action]
+            mean = self.totals[action] / trials if trials > 0 else 0.0
+            bonus = math.sqrt(
+                2.0 * math.log(total_trials) / max(1, trials)
+            )
             score = mean + self.ucb_c * bonus
             if (
                 score > best_score + 1e-9
                 or (abs(score - best_score) <= 1e-9 and self._rng.random() < 0.5)
             ):
                 best_score = score
-                best_candidate = action
-        return best_candidate
+                best_action = action
+        return best_action
 
-    def positive_ratio(self) -> float:
-        """返回带来正收益的改动比例。"""
-        if self.attempts == 0:
-            return 1.0
-        return self._positives / float(self.attempts)
+    def _evaluate_agent(
+        self,
+        agent: Any,
+        evaluate_fn: EvaluationFn,
+        base_seed: int,
+    ) -> List[float]:
+        scores: List[float] = []
+        for offset in range(self.ab_rounds):
+            seed = base_seed + offset
+            score = evaluate_fn(copy.deepcopy(agent), seed)
+            scores.append(score)
+        return scores
+
+    @staticmethod
+    def _mean(values: Sequence[float]) -> float:
+        if not values:
+            return 0.0
+        return sum(values) / float(len(values))
 
     def adapt(
         self,
@@ -169,46 +215,66 @@ class MetaLearner:
         step: int,
         evaluate_fn: EvaluationFn,
     ) -> Tuple[Any, List[str]]:
-        """执行一次自改尝试，返回可能更新的 agent 和日志。"""
-        seed = self._seed_base + step * 97
-        baseline_score = evaluate_fn(copy.deepcopy(agent), seed)
-        action = self.select_candidate()
-        original_snapshot = copy.deepcopy(agent)
-        messages: List[str] = []
-        chosen_agent = original_snapshot
-        actions_to_try = [action]
+        """执行一次自改尝试，返回改动后的 agent 及日志。"""
+        if not callable(evaluate_fn):
+            raise TypeError("evaluate_fn 必须为可调用对象。")
+
+        base_seed = self._seed_base + step * 97
+        baseline_scores = self._evaluate_agent(agent, evaluate_fn, base_seed)
+        primary = self.select_candidate()
+        actions_to_try = [primary]
         if (
             self.fallback_action
             and self.fallback_action not in actions_to_try
         ):
             actions_to_try.append(self.fallback_action)
 
-        for candidate_action in actions_to_try:
-            trial_agent = copy.deepcopy(original_snapshot)
-            applied, info = trial_agent.apply_modification(candidate_action)
-            delta = -self.min_delta
+        messages: List[str] = []
+        chosen_agent = agent
+        accepted = False
+        for action in actions_to_try:
+            if action not in self.counts:
+                self.counts[action] = 0
+                self.totals[action] = 0.0
+
+            trial_agent = copy.deepcopy(agent)
+            applied = False
+            info: str | None = None
+            if hasattr(trial_agent, "apply_modification"):
+                applied, info = trial_agent.apply_modification(action)
+            else:
+                info = "missing apply_modification"
+
+            delta = 0.0
             reverted = True
             if applied:
-                after_score = evaluate_fn(copy.deepcopy(trial_agent), seed)
-                delta = after_score - baseline_score
+                candidate_scores = self._evaluate_agent(
+                    trial_agent,
+                    evaluate_fn,
+                    base_seed,
+                )
+                delta = (
+                    self._mean(candidate_scores) - self._mean(baseline_scores)
+                )
+                self.counts[action] += 1
+                self.totals[action] += delta
+                self.attempts += 1
                 if delta >= 0.0:
                     reverted = False
                     chosen_agent = trial_agent
+                    accepted = True
                     if delta > 0.0:
                         self._positives += 1
                 else:
-                    trial_agent = original_snapshot
+                    info = info or "negative delta"
             else:
-                trial_agent = original_snapshot
-            self.attempts += 1
-            if candidate_action not in self.counts:
-                self.counts[candidate_action] = 0
-                self.totals[candidate_action] = 0.0
-            self.counts[candidate_action] += 1
-            self.totals[candidate_action] += delta
+                info = info or "apply failed"
+                self.counts[action] += 1
+                self.totals[action] += delta
+
             log = AdaptationLog(
                 step=step,
-                action=candidate_action,
+                action=action,
                 delta=delta,
                 reverted=reverted,
                 info=info,
@@ -217,12 +283,11 @@ class MetaLearner:
             message = log.format()
             messages.append(message)
             print(message)
-            if not reverted:
+            if accepted:
                 agent = chosen_agent
                 break
-        else:
-            agent = original_snapshot
+
         return agent, messages
 
 
-__all__ = ["MetaLearner"]
+__all__ = ["MetaLearner", "CodePatcher"]

@@ -44,6 +44,31 @@ class TestEProp(unittest.TestCase):
         self.assertAlmostEqual(layer.eligibility[0][0], expected)
         self.assertGreater(layer.eligibility[0][0], decayed)
 
+    def test_bias_and_weight_eligibility_accumulate_over_steps(self) -> None:
+        params = LIFParams(v_th=1.0, tau_m=5.0, tau_a=5.0, beta=0.0, refractory=1)
+        layer = DenseLIF(
+            n_in=1,
+            n_out=1,
+            params=params,
+            surrogate_fn=lambda _: 0.25,
+            eligibility_lambda=0.8,
+        )
+        layer.weights[0][0] = 0.0
+        layer.bias[0] = 0.0
+        contributions = []
+        for step in range(3):
+            layer.step([1])
+            contributions.append(layer.eligibility[0][0])
+        self.assertTrue(
+            contributions[0] < contributions[1] < contributions[2],
+            f"资格迹应在重复输入时持续累积：{contributions}",
+        )
+        self.assertAlmostEqual(
+            layer.bias_eligibility[0],
+            layer.eligibility[0][0],
+            msg="单输入情况下偏置资格迹应与权重资格迹保持一致",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

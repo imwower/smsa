@@ -44,6 +44,22 @@ class TestLIFDynamics(unittest.TestCase):
         self.assertEqual(spike_2[0], 0, "不应在不应期内重复放电")
         self.assertEqual(spike_3[0], 0, "不应期未结束仍不应放电")
         self.assertEqual(spike_4[0], 1, "不应期结束后应可再次放电")
+        self.assertEqual(layer.v[0], 0.0, "触发后膜电位应被复位为 0")
+
+    def test_membrane_resets_and_recovers_monotonically(self) -> None:
+        layer = make_layer(tau_m=4.0, tau_a=8.0, v_th=0.5, refractory=1)
+        layer.weights[0][0] = 5.0
+        layer.step([1])
+        self.assertEqual(layer.v[0], 0.0, "放电后膜电位应立即复位")
+        # 释放不应期后，逐步衰减到 0，且过程单调
+        values = []
+        for _ in range(3):
+            layer.step([0])
+            values.append(layer.v[0])
+        self.assertTrue(
+            values[0] >= values[1] >= values[2],
+            f"电位应单调衰减，得到序列 {values}",
+        )
 
     def test_membrane_decay_is_slower_with_larger_tau_m(self) -> None:
         fast = make_layer(tau_m=2.0, tau_a=10.0)

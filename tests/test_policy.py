@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 import unittest
 
@@ -31,6 +32,7 @@ class PolicyHeadTest(unittest.TestCase):
 
         baseline = 0.5
         baseline_beta = 0.05
+        losses: list[float] = []
         for step in range(200):
             features, label = dataset[step % len(dataset)]
             probs = head.softmax(head.logits(features))
@@ -40,6 +42,7 @@ class PolicyHeadTest(unittest.TestCase):
             grad = head.policy_grad(probs, action)
             head.update(features, grad, advantage)
             baseline += baseline_beta * (reward - baseline)
+            losses.append(-math.log(max(probs[label], 1e-9)))
 
         correct = 0
         for features, label in dataset:
@@ -49,7 +52,15 @@ class PolicyHeadTest(unittest.TestCase):
                 correct += 1
 
         accuracy = correct / len(dataset)
-        self.assertGreaterEqual(accuracy, 0.9)
+        headroom = len(losses) // 4 or 1
+        early = sum(losses[:headroom]) / headroom
+        late = sum(losses[-headroom:]) / headroom
+        self.assertGreaterEqual(accuracy, 0.9, "策略头应在 200 步内学会线性任务")
+        self.assertLess(
+            late,
+            early,
+            f"损失应下降，初期 {early:.3f} 晚期 {late:.3f}",
+        )
 
 
 if __name__ == "__main__":

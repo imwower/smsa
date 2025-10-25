@@ -1,4 +1,4 @@
-"""5×5 GridWorld 环境实现。"""
+"""5x5 GridWorld 环境实现。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 
 class GridWorld:
-    """简易的 5×5 GridWorld。
+    """简易的 5x5 GridWorld。
 
     代理从 (0,0) 出发，通过上/下/左/右动作移动，终点是 (4,4)。
     每个动作有 0.1 概率随机滑移为任一动作，超出边界会停在原地。

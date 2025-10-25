@@ -26,15 +26,19 @@ class PolicyHead:
         self.n_actions = n_actions
         self.lr = lr
 
-        # 使用较小随机数初始化权重，便于训练收敛。
+        # 使用可选种子初始化权重，控制训练稳定性。
+        init_rng = random.Random(seed)
         init_scale = 0.1
-        rng = random.Random(0)
         self.weights: List[List[float]] = [
-            [rng.uniform(-init_scale, init_scale) for _ in range(n_in)]
+            [init_rng.uniform(-init_scale, init_scale) for _ in range(n_in)]
             for _ in range(n_actions)
         ]
         self.bias: List[float] = [0.0 for _ in range(n_actions)]
-        self._rng = random.Random(seed)
+        # 采样器使用不同的种子，避免和权重相关联。
+        if seed is None:
+            self._rng = random.Random()
+        else:
+            self._rng = random.Random(seed + 1)
 
     def logits(self, counts: Sequence[float]) -> List[float]:
         """计算每个动作的线性得分。"""
@@ -45,7 +49,8 @@ class PolicyHead:
         for action in range(self.n_actions):
             # 计算 w·x + b
             w = self.weights[action]
-            score = sum(w[i] * counts[i] for i in range(self.n_in)) + self.bias[action]
+            score = sum(weight * value for weight, value in zip(w, counts))
+            score += self.bias[action]
             scores.append(score)
         return scores
 
@@ -55,11 +60,13 @@ class PolicyHead:
             raise ValueError("scores 长度必须等于 n_actions。")
 
         max_score = max(scores)
-        exp_scores = [math.exp(s - max_score) for s in scores]
-        denom = sum(exp_scores)
-        if denom == 0.0:
+        # logsumexp 平移，保证数值稳定性。
+        shifted = [score - max_score for score in scores]
+        exp_sum = sum(math.exp(val) for val in shifted)
+        if exp_sum == 0.0:
             raise ZeroDivisionError("softmax 归一化因子为 0。")
-        return [v / denom for v in exp_scores]
+        log_sum = max_score + math.log(exp_sum)
+        return [math.exp(score - log_sum) for score in scores]
 
     def sample_action(self, probs: Sequence[float]) -> int:
         """按给定概率分布采样动作。"""

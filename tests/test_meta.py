@@ -6,7 +6,6 @@ import math
 import types
 import unittest
 from dataclasses import dataclass
-from typing import Iterator
 
 from meta.autoadapt import MetaLearner
 
@@ -24,12 +23,12 @@ class DummyAgent:
 class TestMetaLearner(unittest.TestCase):
     def test_ucb_bonus_shrinks_with_trials(self) -> None:
         learner = MetaLearner()
-        learner.candidates = ["alpha"]
+        learner.actions = ["alpha"]
         learner.counts = {"alpha": 1}
         learner.totals = {"alpha": 1.0}  # mean 1.0
 
         def compute_score() -> float:
-            total = sum(max(1, learner.counts[c]) for c in learner.candidates)
+            total = sum(max(1, learner.counts[c]) for c in learner.actions)
             exploration = max(total, 2)
             mean = learner.totals["alpha"] / learner.counts["alpha"]
             bonus = learner.ucb_c * math.sqrt(
@@ -50,17 +49,19 @@ class TestMetaLearner(unittest.TestCase):
 
     def test_adapt_rolls_back_on_negative_delta(self) -> None:
         learner = MetaLearner()
-        learner.candidates = ["eta_up"]
+        learner.actions = ["eta_up"]
         learner.counts = {"eta_up": 0}
         learner.totals = {"eta_up": 0.0}
         learner.select_candidate = types.MethodType(lambda self: "eta_up", learner)
 
         agent = DummyAgent()
-        values: Iterator[float] = iter([1.0, 0.7])  # before, after
+        call_count = {"n": 0}
 
         def evaluate_fn(_agent: DummyAgent, seed: int) -> float:
             del seed
-            return next(values)
+            idx = call_count["n"] // 5
+            call_count["n"] += 1
+            return 1.0 if idx == 0 else 0.7
 
         updated_agent, messages = learner.adapt(
             agent,
@@ -75,17 +76,19 @@ class TestMetaLearner(unittest.TestCase):
 
     def test_adapt_keeps_positive_delta_and_updates_score(self) -> None:
         learner = MetaLearner()
-        learner.candidates = ["eta_up"]
+        learner.actions = ["eta_up"]
         learner.counts = {"eta_up": 0}
         learner.totals = {"eta_up": 0.0}
         learner.select_candidate = types.MethodType(lambda self: "eta_up", learner)
 
         agent = DummyAgent()
-        values: Iterator[float] = iter([1.0, 1.2])  # before, after
+        call_count = {"n": 0}
 
         def evaluate_fn(_agent: DummyAgent, seed: int) -> float:
             del seed
-            return next(values)
+            idx = call_count["n"] // 5
+            call_count["n"] += 1
+            return 1.0 if idx == 0 else 1.2
 
         updated_agent, messages = learner.adapt(
             agent,
@@ -98,6 +101,36 @@ class TestMetaLearner(unittest.TestCase):
         self.assertEqual(learner.counts["eta_up"], 1)
         self.assertAlmostEqual(learner.totals["eta_up"], 0.2)
         self.assertGreater(learner.positive_ratio(), 0.0)
+
+    def test_ab_testing_reuses_identical_seed_sequence(self) -> None:
+        learner = MetaLearner()
+        learner.actions = ["eta_up"]
+        learner.counts = {"eta_up": 0}
+        learner.totals = {"eta_up": 0.0}
+        learner.select_candidate = types.MethodType(lambda self: "eta_up", learner)
+
+        agent = DummyAgent()
+        seeds_seen: list[int] = []
+        values = [1.0] * 5 + [1.2] * 5
+
+        def evaluate_fn(_agent: DummyAgent, seed: int) -> float:
+            seeds_seen.append(seed)
+            return values[min(len(seeds_seen) - 1, len(values) - 1)]
+
+        learner.adapt(agent, step=5, evaluate_fn=evaluate_fn)
+        self.assertEqual(
+            len(seeds_seen),
+            learner.ab_rounds * 2,
+            "A/B 评估应各运行 ab_rounds 次",
+        )
+        first_half = seeds_seen[: learner.ab_rounds]
+        second_half = seeds_seen[learner.ab_rounds :]
+        self.assertListEqual(
+            first_half,
+            second_half,
+            "候选评估应重用基线使用的随机种子以实现公平对比",
+        )
+
 
 
 if __name__ == "__main__":

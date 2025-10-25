@@ -59,23 +59,28 @@ class EpropGridAgent:
         *,
         hidden_size: int = 32,
         inner_steps: int = 12,
-        hidden_lr: float = 0.035,
+        eta_e: float = 0.035,
+        lam_e: float = 0.9,
         policy_lr: float = 0.06,
         intrinsic_beta: float = 0.35,
         baseline_beta: float = 0.05,
         seed: int | None = None,
     ) -> None:
+        eta_e = max(1e-6, eta_e)
+        lam_e = max(0.0, min(lam_e, 0.999))
         params = LIFParams(v_th=0.5, tau_m=8.0, tau_a=16.0, beta=0.35, refractory=2)
         self.hidden = DenseLIF(
             n_in=state_size,
             n_out=hidden_size,
             params=params,
             surrogate_fn=fast_sigmoid_surrogate,
+            eligibility_lambda=lam_e,
         )
         self.policy = PolicyHead(hidden_size, 4, policy_lr, seed=seed)
-        self.hidden_lr = hidden_lr
+        self.eta_e = eta_e
+        self.lam_e = lam_e
         self.intrinsic_beta = intrinsic_beta
-        self.inner_steps = inner_steps
+        self.inner_steps = max(1, inner_steps)
         self.baseline = 0.0
         self.baseline_beta = baseline_beta
         self.surrogate_name = "fast_sigmoid"
@@ -130,20 +135,20 @@ class EpropGridAgent:
         weights_snapshot = [row[:] for row in self.policy.weights]
         third_factor = self._learning_signal(grad, advantage, weights_snapshot)
         self.policy.update(counts, grad, advantage)
-        self.hidden.eprop_apply(third_factor, self.hidden_lr)
+        self.hidden.eprop_apply(third_factor, self.eta_e)
         self.baseline += self.baseline_beta * advantage
 
     def apply_modification(self, action: str) -> Tuple[bool, str | None]:
         """供 MetaLearner 调用的自改接口。"""
         info: str | None = None
         if action == "eta_up":
-            self.hidden_lr = min(self.hidden_lr * 1.25, 0.12)
+            self.eta_e = min(self.eta_e * 1.25, 0.12)
             self.policy.lr = min(self.policy.lr * 1.15, 0.12)
-            return True, info
+            return True, f"eta_e={self.eta_e:.3f}"
         if action == "eta_down":
-            self.hidden_lr = max(self.hidden_lr * 0.8, 0.01)
+            self.eta_e = max(self.eta_e * 0.8, 0.005)
             self.policy.lr = max(self.policy.lr * 0.8, 0.02)
-            return True, info
+            return True, f"eta_e={self.eta_e:.3f}"
         if action == "vth_up":
             self.hidden.params.v_th = min(self.hidden.params.v_th + 0.05, 1.2)
             return True, info
@@ -191,10 +196,11 @@ def _run_episode(
     visit_counts: DefaultDict[int, int],
     *,
     training: bool,
-) -> Tuple[float, bool, float]:
+) -> Tuple[float, bool, float, float]:
     obs = env.reset()
     agent.begin_episode()
     total_reward = 0.0
+    base_reward_sum = 0.0
     goal_reached = False
     steps = 0
     done = False
@@ -209,6 +215,7 @@ def _run_episode(
         next_obs, base_reward, done, info = env.step(action)
         reward = base_reward + bonus
         total_reward += reward
+        base_reward_sum += base_reward
         spike_sum += sum(counts) * agent.inner_steps
         if training:
             agent.learn(counts, probs, action, reward)
@@ -216,7 +223,7 @@ def _run_episode(
             goal_reached = True
         obs = next_obs
         steps += 1
-    return total_reward, goal_reached, spike_sum
+    return total_reward, goal_reached, spike_sum, base_reward_sum
 
 
 def _evaluate_agent(
@@ -233,7 +240,12 @@ def _evaluate_agent(
         env = env_cfg.make_env(seed=env_seed)
         agent.reseed(rng.randrange(1_000_000))
         visits: DefaultDict[int, int] = collections.defaultdict(int)
-        reward, _success, _spikes = _run_episode(agent, env, visits, training=False)
+        reward, _success, _spikes, _env_return = _run_episode(
+            agent,
+            env,
+            visits,
+            training=False,
+        )
         score += reward
     return score / float(max(episodes, 1))
 
@@ -243,16 +255,28 @@ def train_gridworld(
     episodes: int,
     seed: int | None,
     env_cfg: GridWorldConfig,
+    eta_e: float = 0.035,
+    lam_e: float = 0.9,
+    inner_steps: int = 12,
+    intrinsic_beta: float = 0.35,
 ) -> Dict[str, float]:
     if seed is not None:
         random.seed(seed)
     logger = get_logger(__name__)
-    agent = EpropGridAgent(state_size=env_cfg.size * env_cfg.size, seed=seed)
+    agent = EpropGridAgent(
+        state_size=env_cfg.size * env_cfg.size,
+        inner_steps=inner_steps,
+        eta_e=eta_e,
+        lam_e=lam_e,
+        intrinsic_beta=intrinsic_beta,
+        seed=seed,
+    )
     meta = MetaLearner(window=20, min_delta=0.05, ab_episodes=5)
     visit_counts: DefaultDict[int, int] = collections.defaultdict(int)
     return_history: List[float] = []
     all_returns: List[float] = []
     rolling_returns: collections.deque[float] = collections.deque(maxlen=10)
+    rolling_env_returns: collections.deque[float] = collections.deque(maxlen=10)
     rolling_success: collections.deque[int] = collections.deque(maxlen=10)
     success_history: List[int] = []
     csv_path = pathlib.Path("runs/gridworld_metrics.csv")
@@ -304,7 +328,7 @@ def train_gridworld(
             env_seed = (seed or 0) * 1009 + episode * 47 + 17
             env = env_cfg.make_env(seed=env_seed)
             agent.reseed(env_seed)
-            reward, success, spikes = _run_episode(
+            reward, success, spikes, env_return = _run_episode(
                 agent,
                 env,
                 visit_counts,
@@ -315,6 +339,7 @@ def train_gridworld(
             rolling_returns.append(reward)
             rolling_success.append(1 if success else 0)
             success_history.append(1 if success else 0)
+            rolling_env_returns.append(env_return)
 
             meta_logs: List[str] = []
             if meta.should_trigger(return_history):
@@ -335,10 +360,21 @@ def train_gridworld(
             )
 
             if episode % 10 == 0:
+                avg_return = (
+                    sum(rolling_returns) / float(len(rolling_returns))
+                    if rolling_returns
+                    else 0.0
+                )
+                avg_env_return = (
+                    sum(rolling_env_returns) / float(len(rolling_env_returns))
+                    if rolling_env_returns
+                    else 0.0
+                )
                 logger.info(
-                    "Episode %03d return %.3f success_rate %.2f spikes %.1f meta=%s delta=%.3f reverted=%s",
+                    "Episode %03d avg_total %.3f avg_env %.3f success_rate %.2f spikes %.1f meta=%s delta=%.3f reverted=%s",
                     episode,
-                    reward,
+                    avg_return,
+                    avg_env_return,
                     success_rate,
                     spikes,
                     last_meta["meta_action"],
@@ -384,6 +420,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--step-cost", type=float, default=-0.01, help="每步惩罚")
     parser.add_argument("--goal-reward", type=float, default=1.0, help="终点奖励")
     parser.add_argument("--max-steps", type=int, default=50, help="单回合最大步数")
+    parser.add_argument("--eta-e", type=float, default=0.035, help="e-prop 学习率 η_e")
+    parser.add_argument("--lam-e", type=float, default=0.9, help="资格迹衰减 λ_e")
+    parser.add_argument(
+        "--inner-steps",
+        type=int,
+        default=12,
+        help="同一观测积分步骤数",
+    )
+    parser.add_argument(
+        "--intrinsic-beta",
+        type=float,
+        default=0.35,
+        help="探索新奇奖励系数 β",
+    )
     return parser.parse_args()
 
 
@@ -397,7 +447,15 @@ def main() -> None:
         goal_reward=args.goal_reward,
         max_steps=args.max_steps,
     )
-    metrics = train_gridworld(episodes=args.episodes, seed=args.seed, env_cfg=env_cfg)
+    metrics = train_gridworld(
+        episodes=args.episodes,
+        seed=args.seed,
+        env_cfg=env_cfg,
+        eta_e=args.eta_e,
+        lam_e=args.lam_e,
+        inner_steps=args.inner_steps,
+        intrinsic_beta=args.intrinsic_beta,
+    )
     logger.info("Final metrics: %s", metrics)
 
 
