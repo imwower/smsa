@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
 
 from envs.gridworld import GridWorld
 from meta.autoadapt import MetaLearner
-from snn.dense import DenseLIF
+from snn.dense import DenseLIF, LinearTemporalUnit
 from snn.lif import LIFParams, fast_sigmoid_surrogate, triangular_surrogate
 from snn.policy import PolicyHead
 from tools.logger import EpisodeMetricsLogger, get_logger, setup_logging
@@ -70,7 +70,7 @@ class EpropGridAgent:
         lam_e = max(0.0, min(lam_e, 0.999))
         params = LIFParams(v_th=0.5, tau_m=8.0, tau_a=16.0, beta=0.35, refractory=2)
         self.hidden = DenseLIF(
-            n_in=state_size,
+            n_in=state_size * 2,
             n_out=hidden_size,
             params=params,
             surrogate_fn=fast_sigmoid_surrogate,
@@ -91,6 +91,13 @@ class EpropGridAgent:
         self._seed = seed or 0
         self._policy_seed = self._seed
         self.reseed(self._seed)
+        self.temporal = LinearTemporalUnit(
+            n_in=state_size,
+            n_state=state_size,
+            beta=0.9,
+        )
+        self._rate_rng = random.Random(seed or 0)
+        self.state_size = state_size
 
     def reseed(self, seed: int) -> None:
         """重置采样随机源，便于 A/B 测试复现。"""
@@ -99,11 +106,33 @@ class EpropGridAgent:
 
     def begin_episode(self) -> None:
         self.hidden.reset_state()
+        self.temporal.reset()
+
+    def _encode_obs(self, obs: Sequence[float]) -> List[float]:
+        return [1.0 if val >= 0.5 else 0.0 for val in obs]
+
+    def _compose_rates(self, obs: Sequence[float]) -> List[float]:
+        obs_bits = self._encode_obs(obs)
+        temporal_state = self.temporal.transform(obs_bits)
+        temporal_rates = [max(0.0, min(val, 1.0)) for val in temporal_state]
+        return obs_bits + temporal_rates
+
+    def _sample_spikes(self, rates: Sequence[float]) -> List[int]:
+        spikes: List[int] = []
+        for rate in rates:
+            if rate >= 1.0:
+                spikes.append(1)
+            elif rate <= 0.0:
+                spikes.append(0)
+            else:
+                spikes.append(1 if self._rate_rng.random() < rate else 0)
+        return spikes
 
     def _integrate_counts(self, obs: Sequence[float]) -> List[float]:
         counts = [0.0 for _ in range(self.hidden.n_out)]
-        spikes_in = [int(round(x)) for x in obs]
+        rates = self._compose_rates(obs)
         for _ in range(self.inner_steps):
+            spikes_in = self._sample_spikes(rates)
             spikes, _psis, _elig, _bias = self.hidden.step(spikes_in)
             for j, fired in enumerate(spikes):
                 counts[j] += fired

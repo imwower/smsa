@@ -99,6 +99,15 @@ python -m pytest -q
 # 覆盖：LIF 触发 / 复位、资格迹更新、策略 REINFORCE 收敛、元控制 UCB / A-B / 回滚
 ```
 
+### 快速回归（CI 建议顺序）
+
+1. `python scripts/smoke_env.py` — 运行最小随机策略冒烟，快速确认 GridWorld 环境输出稳定。
+2. `python scripts/train_gridworld.py --episodes 30` — 观察平均回报是否上升，并确认 `[meta]` 自改触发记录。
+3. `python scripts/train_smsa.py --episodes 30` — 确认 Self-Model 的 `nll` 与 `cause_acc` 指标走势正常（NLL 下降、cause_acc ≥ 0.7 目标）。
+4. `python -m pytest -q` — 单元测试全绿。
+
+> 以上步骤可直接写入 CI，确保脚本 + 单测在变更后始终可运行。
+
 ---
 
 ## 安全与合规
