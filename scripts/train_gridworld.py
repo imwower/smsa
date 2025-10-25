@@ -20,7 +20,7 @@ from meta.autoadapt import MetaLearner
 from snn.dense import DenseLIF
 from snn.lif import LIFParams, fast_sigmoid_surrogate, triangular_surrogate
 from snn.policy import PolicyHead
-from tools.logger import CsvLogger, get_logger, setup_logging
+from tools.logger import EpisodeMetricsLogger, get_logger, setup_logging
 
 
 def patched_surrogate(u: float, slope: float = 1.5) -> float:
@@ -81,6 +81,10 @@ class EpropGridAgent:
         self.lam_e = lam_e
         self.intrinsic_beta = intrinsic_beta
         self.inner_steps = max(1, inner_steps)
+        self.min_inner_steps = 4
+        self.max_inner_steps = 30
+        self.min_hidden = 8
+        self.max_hidden = max(hidden_size * 2, hidden_size + 4)
         self.baseline = 0.0
         self.baseline_beta = baseline_beta
         self.surrogate_name = "fast_sigmoid"
@@ -138,6 +142,29 @@ class EpropGridAgent:
         self.hidden.eprop_apply(third_factor, self.eta_e)
         self.baseline += self.baseline_beta * advantage
 
+    def _append_hidden_neuron(self) -> None:
+        for i in range(self.hidden.n_in):
+            self.hidden.weights[i].append(random.uniform(-0.1, 0.1))
+            self.hidden.eligibility[i].append(0.0)
+        self.hidden.bias.append(0.0)
+        self.hidden.bias_eligibility.append(0.0)
+        self.hidden.n_out += 1
+        self.hidden.reset_state()
+        self.policy.add_input()
+
+    def _remove_hidden_neuron(self) -> bool:
+        if self.hidden.n_out <= self.min_hidden:
+            return False
+        idx = self.hidden.n_out - 1
+        for i in range(self.hidden.n_in):
+            self.hidden.weights[i].pop(idx)
+            self.hidden.eligibility[i].pop(idx)
+        self.hidden.bias.pop(idx)
+        self.hidden.bias_eligibility.pop(idx)
+        self.hidden.n_out -= 1
+        self.hidden.reset_state()
+        return self.policy.prune_input()
+
     def apply_modification(self, action: str) -> Tuple[bool, str | None]:
         """供 MetaLearner 调用的自改接口。"""
         info: str | None = None
@@ -162,15 +189,24 @@ class EpropGridAgent:
             self.intrinsic_beta = max(self.intrinsic_beta * 0.75, 0.05)
             return True, f"beta={self.intrinsic_beta:.3f}"
         if action == "inner_up":
-            if self.inner_steps >= 24:
+            if self.inner_steps >= self.max_inner_steps:
                 return False, None
-            self.inner_steps += 2
+            self.inner_steps = min(self.inner_steps + 2, self.max_inner_steps)
             return True, f"inner_steps={self.inner_steps}"
         if action == "inner_down":
-            if self.inner_steps <= 6:
+            if self.inner_steps <= self.min_inner_steps:
                 return False, None
-            self.inner_steps -= 2
+            self.inner_steps = max(self.inner_steps - 2, self.min_inner_steps)
             return True, f"inner_steps={self.inner_steps}"
+        if action == "add_neuron":
+            if self.hidden.n_out >= self.max_hidden:
+                return False, None
+            self._append_hidden_neuron()
+            return True, f"n_hidden={self.hidden.n_out}"
+        if action == "prune_neuron":
+            if not self._remove_hidden_neuron():
+                return False, None
+            return True, f"n_hidden={self.hidden.n_out}"
         if action == "switch_surrogate":
             if self.surrogate_name == "fast_sigmoid":
                 self.hidden.set_surrogate(triangular_surrogate)
@@ -280,17 +316,6 @@ def train_gridworld(
     rolling_success: collections.deque[int] = collections.deque(maxlen=10)
     success_history: List[int] = []
     csv_path = pathlib.Path("runs/gridworld_metrics.csv")
-    fieldnames = [
-        "episode",
-        "return",
-        "success_rate",
-        "spikes",
-        "nll",
-        "cause_acc",
-        "meta_action",
-        "delta",
-        "reverted",
-    ]
     last_meta = {"meta_action": "none", "delta": 0.0, "reverted": False}
 
     def evaluate_fn(candidate: EpropGridAgent, eval_seed: int) -> float:
@@ -323,7 +348,7 @@ def train_gridworld(
             "reverted": reverted,
         }
 
-    with CsvLogger(csv_path, fieldnames) as csv_logger:
+    with EpisodeMetricsLogger(logger, csv_path, print_every=10) as metrics_logger:
         for episode in range(1, episodes + 1):
             env_seed = (seed or 0) * 1009 + episode * 47 + 17
             env = env_cfg.make_env(seed=env_seed)
@@ -359,30 +384,7 @@ def train_gridworld(
                 else 0.0
             )
 
-            if episode % 10 == 0:
-                avg_return = (
-                    sum(rolling_returns) / float(len(rolling_returns))
-                    if rolling_returns
-                    else 0.0
-                )
-                avg_env_return = (
-                    sum(rolling_env_returns) / float(len(rolling_env_returns))
-                    if rolling_env_returns
-                    else 0.0
-                )
-                logger.info(
-                    "Episode %03d avg_total %.3f avg_env %.3f success_rate %.2f spikes %.1f meta=%s delta=%.3f reverted=%s",
-                    episode,
-                    avg_return,
-                    avg_env_return,
-                    success_rate,
-                    spikes,
-                    last_meta["meta_action"],
-                    last_meta["delta"],
-                    last_meta["reverted"],
-                )
-
-            csv_logger.log(
+            metrics_logger.log(
                 {
                     "episode": episode,
                     "return": reward,

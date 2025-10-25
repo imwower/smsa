@@ -27,10 +27,10 @@ class PolicyHead:
         self.lr = lr
 
         # 使用可选种子初始化权重，控制训练稳定性。
-        init_rng = random.Random(seed)
+        self._weight_rng = random.Random(seed)
         init_scale = 0.1
         self.weights: List[List[float]] = [
-            [init_rng.uniform(-init_scale, init_scale) for _ in range(n_in)]
+            [self._weight_rng.uniform(-init_scale, init_scale) for _ in range(n_in)]
             for _ in range(n_actions)
         ]
         self.bias: List[float] = [0.0 for _ in range(n_actions)]
@@ -111,6 +111,28 @@ class PolicyHead:
             for i in range(self.n_in):
                 self.weights[action][i] -= self.lr * g * counts[i]
             self.bias[action] -= self.lr * g
+
+    def add_input(self, count: int = 1) -> None:
+        """在策略头中追加新的输入通道。"""
+        for _ in range(max(1, count)):
+            self._append_input()
+
+    def prune_input(self) -> bool:
+        """移除最后一个输入通道，若无法再裁剪则返回 False。"""
+        if self.n_in <= 1:
+            return False
+        for action in range(self.n_actions):
+            self.weights[action].pop()
+        self.n_in -= 1
+        return True
+
+    def _append_input(self) -> None:
+        init_scale = 0.1
+        for action in range(self.n_actions):
+            self.weights[action].append(
+                self._weight_rng.uniform(-init_scale, init_scale)
+            )
+        self.n_in += 1
 
 
 def _generate_toy_data(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 
 from snn.dense import DenseLIF
 from snn.lif import LIFParams, fast_sigmoid_surrogate
@@ -161,6 +161,37 @@ class SelfModel:
             energy_norm=energy_norm,
         )
 
+    def _head_gradients(
+        self,
+        *,
+        state: SelfModelState,
+        next_obs_index: int,
+        reward_target: float,
+        energy_target: float,
+        cause_label: int,
+    ) -> Tuple[List[float], float, float, List[float]]:
+        if not (0 <= next_obs_index < self.obs_dim):
+            raise ValueError("next_obs_index 超出范围。")
+        if cause_label not in (0, 1):
+            raise ValueError("cause_label 必须为 0/1。")
+
+        target_next = [0.0 for _ in range(self.obs_dim)]
+        target_next[next_obs_index] = 1.0
+        next_grad = [
+            self.obs_weight * (state.probs_next[idx] - target_next[idx])
+            for idx in range(self.obs_dim)
+        ]
+        reward_grad = self.reward_weight * (state.pred_reward - reward_target)
+        energy_grad = self.energy_weight * (state.pred_energy - energy_target)
+
+        target_cause = [0.0, 0.0]
+        target_cause[cause_label] = 1.0
+        cause_grad = [
+            self.cause_weight * (state.probs_cause[idx] - target_cause[idx])
+            for idx in range(self.cause_dim)
+        ]
+        return next_grad, reward_grad, energy_grad, cause_grad
+
     def learning_signal(
         self,
         *,
@@ -170,7 +201,7 @@ class SelfModel:
         energy_grad: float,
         cause_grad: Sequence[float],
     ) -> List[float]:
-        """汇总各读出头对隐藏层的三因子学习信号。"""
+        """汇总各读出头梯度并返回 L_self。"""
         signals = [0.0 for _ in range(self.hidden.n_out)]
         for idx, grad in enumerate(next_grad):
             for h in range(self.hidden.n_out):
@@ -223,35 +254,27 @@ class SelfModel:
         cause_label: int,
     ) -> None:
         """执行一次自我模型参数更新。"""
-        if not (0 <= next_obs_index < self.obs_dim):
-            raise ValueError("next_obs_index 超出范围。")
-        if cause_label not in (0, 1):
-            raise ValueError("cause_label 必须为 0/1。")
+        (
+            next_grad,
+            reward_grad,
+            energy_grad,
+            cause_grad,
+        ) = self._head_gradients(
+            state=state,
+            next_obs_index=next_obs_index,
+            reward_target=reward_target,
+            energy_target=energy_target,
+            cause_label=cause_label,
+        )
 
-        target_next = [0.0 for _ in range(self.obs_dim)]
-        target_next[next_obs_index] = 1.0
-        next_grad = [
-            self.obs_weight * (state.probs_next[idx] - target_next[idx])
-            for idx in range(self.obs_dim)
-        ]
-        reward_grad = self.reward_weight * (state.pred_reward - reward_target)
-        energy_grad = self.energy_weight * (state.pred_energy - energy_target)
-
-        target_cause = [0.0, 0.0]
-        target_cause[cause_label] = 1.0
-        cause_grad = [
-            self.cause_weight * (state.probs_cause[idx] - target_cause[idx])
-            for idx in range(self.cause_dim)
-        ]
-
-        signals = self.learning_signal(
+        l_self = self.learning_signal(
             state=state,
             next_grad=next_grad,
             reward_grad=reward_grad,
             energy_grad=energy_grad,
             cause_grad=cause_grad,
         )
-        self.hidden.eprop_apply(signals, self.hidden_lr)
+        self.hidden.eprop_apply(l_self, self.hidden_lr)
         self.update_heads(
             state=state,
             next_grad=next_grad,
@@ -259,7 +282,7 @@ class SelfModel:
             energy_grad=energy_grad,
             cause_grad=cause_grad,
         )
-        return signals
+        return l_self
 
 
 __all__ = ["SelfModel", "SelfModelState"]

@@ -24,6 +24,18 @@ def parse_args() -> argparse.Namespace:
         default="runs",
         help="指标 CSV 的输出目录",
     )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=1.0,
+        help="策略损失权重 α",
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=1.0,
+        help="Self-Model 学习信号权重 β",
+    )
     return parser.parse_args()
 
 
@@ -35,6 +47,8 @@ def main() -> None:
         episodes=args.episodes,
         seed=args.seed,
         output_dir=args.output_dir,
+        policy_alpha=args.alpha,
+        policy_beta=args.beta,
     )
     logger.info(
         "SMSA 训练完成 baseline=%s dream=%s actual=%s",

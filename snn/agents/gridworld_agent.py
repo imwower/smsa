@@ -308,13 +308,15 @@ class GridworldAgent:
             self.intrinsic_beta = max(self.intrinsic_beta * 0.8, 0.05)
             return True, info
         if action == "inner_steps_up":
-            self.inner_steps = min(self.inner_steps + 4, 36)
-            return True, info
-        if action == "inner_steps_down":
-            if self.inner_steps <= 10:
+            if self.inner_steps >= 30:
                 return False, info
-            self.inner_steps = max(self.inner_steps - 4, 8)
-            return True, info
+            self.inner_steps = min(self.inner_steps + 2, 30)
+            return True, f"inner_steps={self.inner_steps}"
+        if action == "inner_steps_down":
+            if self.inner_steps <= 4:
+                return False, info
+            self.inner_steps = max(self.inner_steps - 2, 4)
+            return True, f"inner_steps={self.inner_steps}"
         if action == "add_neuron":
             added = self.add_neuron()
             if added:
@@ -334,7 +336,7 @@ class GridworldAgent:
             self.set_surrogate(next_name)
             return True, info
         if action == "code_patch_surrogate":
-            info = self.code_patcher.apply(self.hidden)
+            info = self.code_patcher.apply(self)
             self.patched = True
             self.surrogate_name = "dynamic_patch"
             self.last_patch_info = info

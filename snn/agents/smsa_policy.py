@@ -330,7 +330,7 @@ class SNNPolicy:
                 self.surrogate_name = "fast_sigmoid"
             return True, self.surrogate_name
         if action == "patch_surrogate":
-            info = self.code_patcher.apply(self.hidden)
+            info = self.code_patcher.apply(self)
             self.last_patch_info = info
             self.surrogate_name = "code_patch"
             return True, info

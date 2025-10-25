@@ -5,8 +5,8 @@ from __future__ import annotations
 import argparse
 import collections
 import copy
-import gzip
 import glob
+import gzip
 import math
 import os
 import random
@@ -728,14 +728,18 @@ def build_corpora(paths: Sequence[str]) -> List[Tuple[str, List[List[str]]]]:
 
 
 def train(args: argparse.Namespace) -> None:
-    input_paths = expand_inputs(args.inputs)
+    patterns = args.inputs if args.inputs else args.corpus_glob
+    if not patterns:
+        print("No corpus patterns provided.", file=sys.stderr)
+        return
+    input_paths = expand_inputs(patterns)
     corpora = build_corpora(input_paths)
     if not corpora:
         print("No usable lines found.", file=sys.stderr)
         return
 
     flattened = [tokens for _, corpus in corpora for tokens in corpus]
-    vocab = Vocab.build(flattened, max_size=args.vocab)
+    vocab = Vocab.build(flattened, max_size=args.vocab_size)
     vocab_size = len(vocab.id_to_token)
 
     random.seed(args.seed)
@@ -868,8 +872,20 @@ def train(args: argparse.Namespace) -> None:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SNN-based streaming text LM")
-    parser.add_argument("inputs", nargs="+", help="Text files or .gz archives")
-    parser.add_argument("--vocab", type=int, default=1024, help="Maximum vocabulary size.")
+    parser.add_argument(
+        "--corpus-glob",
+        nargs="*",
+        default=["data/*.txt", "data/*.txt.gz", "data/*.gz"],
+        help="Glob patterns for streaming text corpora (.txt or .gz).",
+    )
+    parser.add_argument(
+        "--inputs",
+        nargs="*",
+        default=None,
+        help="Explicit file paths (overrides glob).",
+    )
+    parser.add_argument("--vocab-size", type=int, default=1024, help="Maximum vocabulary size (includes specials).")
+    parser.add_argument("--vocab", type=int, dest="vocab_size", help=argparse.SUPPRESS)
     parser.add_argument("--input-dim", type=int, default=256, help="Hash projection dimension.")
     parser.add_argument("--hidden-size", type=int, default=128, help="Hidden layer size.")
     parser.add_argument("--k-proj", type=int, default=3, help="Hash projections per token.")

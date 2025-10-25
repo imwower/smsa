@@ -7,7 +7,7 @@ import copy
 import math
 import random
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple, Set
 
 
 EvaluationFn = Callable[[Any, int], float]
@@ -55,16 +55,44 @@ class CodePatcher:
         self.current_idx = (self.current_idx + 1) % len(self.expressions)
         return self.expressions[self.current_idx]
 
-    def apply(self, layer: Any, expression: str | None = None) -> str:
+    def apply(self, target: Any, expression: str | None = None) -> str:
         if expression is None:
             expression = self.next_expression()
         else:
             self._validate(expression)
         func = self._build(expression)
-        if not hasattr(layer, "set_surrogate"):
-            raise AttributeError("目标对象缺少 set_surrogate 方法。")
-        layer.set_surrogate(func)
-        return f"patch surrogate expr={expression}"
+        patched = self._patch_recursive(target, func, set())
+        if patched == 0:
+            raise AttributeError("未找到可替换 surrogate 的 LIF 层。")
+        return f"patch surrogate expr={expression} layers={patched}"
+
+    def _patch_recursive(
+        self,
+        target: Any,
+        func: Callable[[float], float],
+        visited: Set[int],
+    ) -> int:
+        if target is None:
+            return 0
+        obj_id = id(target)
+        if obj_id in visited:
+            return 0
+        visited.add(obj_id)
+        patched = 0
+        set_surrogate = getattr(target, "set_surrogate", None)
+        if callable(set_surrogate):
+            set_surrogate(func)
+            patched += 1
+        if isinstance(target, dict):
+            for value in target.values():
+                patched += self._patch_recursive(value, func, visited)
+        elif isinstance(target, (list, tuple, set)):
+            for item in target:
+                patched += self._patch_recursive(item, func, visited)
+        elif hasattr(target, "__dict__"):
+            for value in target.__dict__.values():
+                patched += self._patch_recursive(value, func, visited)
+        return patched
 
 
 @dataclass
@@ -99,6 +127,8 @@ class MetaLearner:
         "intrinsic_down",
         "inner_up",
         "inner_down",
+        "add_neuron",
+        "prune_neuron",
         "switch_surrogate",
         "patch_surrogate",
     ]

@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
+import csv
 import logging
 import logging.config
 import pathlib
 import sys
 from typing import Iterable, Mapping, Optional, Sequence
 
-import csv
-
 
 _CONFIG_LOADED = False
 _DEFAULT_CONFIG = pathlib.Path(__file__).resolve().parent / "logging.conf"
+METRIC_FIELDNAMES = [
+    "episode",
+    "return",
+    "success_rate",
+    "spikes",
+    "nll",
+    "cause_acc",
+    "meta_action",
+    "delta",
+    "reverted",
+]
 
 
 def setup_logging(config_path: Optional[pathlib.Path | str] = None) -> None:
@@ -76,4 +86,59 @@ class CsvLogger:
         tb: object | None,
     ) -> None:
         del tb
+        self.close()
+
+
+class EpisodeMetricsLogger:
+    """统一的训练指标记录器，负责写 CSV 并周期性打印摘要。"""
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        path: pathlib.Path | str,
+        *,
+        print_every: int = 10,
+    ) -> None:
+        self.logger = logger
+        self.print_every = max(1, int(print_every))
+        self._csv_logger = CsvLogger(path, METRIC_FIELDNAMES)
+
+    def log(self, row: Mapping[str, object]) -> None:
+        payload = {}
+        for field in METRIC_FIELDNAMES:
+            if field not in row:
+                raise KeyError(f"缺少字段 {field}")
+            payload[field] = row[field]
+        self._csv_logger.log(payload)
+        episode = int(payload["episode"])
+        if episode % self.print_every == 0:
+            self.logger.info(
+                (
+                    "Episode %03d return=%.3f success_rate=%.2f "
+                    "spikes=%.1f nll=%.3f cause_acc=%.2f meta=%s delta=%.3f reverted=%s"
+                ),
+                episode,
+                float(payload["return"]),
+                float(payload["success_rate"]),
+                float(payload["spikes"]),
+                float(payload["nll"]),
+                float(payload["cause_acc"]),
+                payload["meta_action"],
+                float(payload["delta"]),
+                bool(payload["reverted"]),
+            )
+
+    def close(self) -> None:
+        self._csv_logger.close()
+
+    def __enter__(self) -> "EpisodeMetricsLogger":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object | None,
+    ) -> None:
+        del exc_type, exc, tb
         self.close()

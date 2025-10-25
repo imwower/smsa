@@ -17,7 +17,7 @@ from snn.agents.smsa_policy import SNNPolicy, build_self_model_input
 from snn.lif import LIFParams
 from snn.selfmodel import SelfModel
 from snn.training.gridworld_meta import GridWorldConfig
-from tools.logger import CsvLogger, get_logger
+from tools.logger import EpisodeMetricsLogger, get_logger
 from tools.replay import ReplayBuffer
 
 
@@ -103,12 +103,10 @@ def simulate_recovery(
     use_dream: bool,
     max_episodes: int = 120,
     dream_sequences: int = 3,
+    policy_alpha: float = 1.0,
+    policy_beta: float = 1.0,
 ) -> int:
     success_window: deque[int] = deque(maxlen=30)
-    policy_alpha = 1.0
-    policy_beta = 1.0
-    meta_effect_span = 12
-    meta_recent_steps = 0
     state_size = env_cfg.size * env_cfg.size
 
     visit_counts: Dict[int, int] = defaultdict(int)
@@ -215,6 +213,8 @@ def train_smsa(
     seed: int | None = None,
     output_dir: str = "runs",
     validate: bool = True,
+    policy_alpha: float = 1.0,
+    policy_beta: float = 1.0,
 ) -> RecoverySummary:
     if seed is not None:
         random.seed(seed)
@@ -248,22 +248,9 @@ def train_smsa(
 
     os.makedirs(output_dir, exist_ok=True)
     csv_path = Path(output_dir) / "self_model_metrics.csv"
-    fieldnames = [
-        "episode",
-        "return",
-        "success_rate",
-        "spikes",
-        "nll",
-        "cause_acc",
-        "meta_action",
-        "delta",
-        "reverted",
-    ]
 
-    policy_alpha = 1.0
-    policy_beta = 1.0
-    meta_effect_span = 12
-    meta_recent_steps = 0
+    cause_flag_span = 4
+    meta_cause_steps = 0
 
     visit_counts: Dict[int, int] = defaultdict(int)
     nll_history: List[float] = []
@@ -271,6 +258,7 @@ def train_smsa(
     success_window: deque[int] = deque(maxlen=20)
     running_return: float | None = None
     return_history: List[float] = []
+    recent_meta_outcomes: deque[bool] = deque(maxlen=6)
     forget_episode = episodes // 2
     forget_triggered = False
     baseline_recovery_episode: int | None = None
@@ -280,26 +268,41 @@ def train_smsa(
     recover_threshold = 0.9
     last_meta = {"meta_action": "none", "delta": 0.0, "reverted": False}
 
+    def meta_short_ratio() -> float:
+        if not recent_meta_outcomes:
+            return 1.0
+        return sum(1 for flag in recent_meta_outcomes if flag) / float(len(recent_meta_outcomes))
+
     def parse_meta(logs: List[str]) -> None:
-        nonlocal last_meta
+        nonlocal last_meta, meta_cause_steps
         if not logs:
             last_meta = {"meta_action": "none", "delta": 0.0, "reverted": False}
             return
-        message = logs[-1]
-        try:
-            action = message.split("action=")[1].split()[0]
-        except (IndexError, ValueError):
-            action = "unknown"
-        try:
-            delta_val = float(message.split("delta=")[1].split()[0])
-        except (IndexError, ValueError):
-            delta_val = 0.0
-        reverted = "reverted" in message
-        last_meta = {
-            "meta_action": action,
-            "delta": delta_val,
-            "reverted": reverted,
-        }
+        accepted = False
+        for message in logs:
+            try:
+                action = message.split("action=")[1].split()[0]
+            except (IndexError, ValueError):
+                action = "unknown"
+            try:
+                delta_val = float(message.split("delta=")[1].split()[0])
+            except (IndexError, ValueError):
+                delta_val = 0.0
+            reverted = "reverted" in message
+            positive = (delta_val > 0.0) and not reverted
+            recent_meta_outcomes.append(positive)
+            if "accepted" in message and not reverted:
+                accepted = True
+            last_meta = {
+                "meta_action": action,
+                "delta": delta_val,
+                "reverted": reverted,
+            }
+        if accepted:
+            meta_cause_steps = cause_flag_span
+        logger.info(
+            "[meta] short_window_positive_ratio=%.2f", meta_short_ratio()
+        )
 
     def evaluate_for_meta(candidate: SNNPolicy, eval_seed: int) -> float:
         rng_state = random.getstate()
@@ -362,7 +365,7 @@ def train_smsa(
         random.setstate(rng_state)
         return total_return / float(max(meta.ab_episodes, 1))
 
-    with CsvLogger(csv_path, fieldnames) as csv_logger:
+    with EpisodeMetricsLogger(logger, csv_path, print_every=10) as metrics_logger:
         for episode in range(1, episodes + 1):
             obs = env.reset()
             policy.begin_episode()
@@ -400,7 +403,7 @@ def train_smsa(
                     / float(policy.inner_steps * policy.hidden.n_out),
                     1.0,
                 )
-                cause_label = 1 if meta_recent_steps > 0 else 0
+                cause_label = 1 if meta_cause_steps > 0 else 0
                 self_signal = self_model.update(
                     state=self_state,
                     next_obs_index=next_index,
@@ -417,8 +420,8 @@ def train_smsa(
                     beta=policy_beta,
                 )
                 policy.update_baseline(reward)
-                if meta_recent_steps > 0:
-                    meta_recent_steps -= 1
+                if meta_cause_steps > 0:
+                    meta_cause_steps -= 1
                 buffer.add(
                     state_index,
                     action,
@@ -468,8 +471,6 @@ def train_smsa(
                 )
                 for meta_msg in meta_logs:
                     logger.info(meta_msg)
-                if any("accepted" in msg for msg in meta_logs):
-                    meta_recent_steps = meta_effect_span
                 return_history.clear()
                 return_history.append(episode_reward)
             parse_meta(meta_logs)
@@ -480,21 +481,7 @@ def train_smsa(
                 else 0.0
             )
 
-            if episode % 10 == 0:
-                logger.info(
-                    "Episode %03d return %.3f success_rate %.2f spikes %.1f nll %.3f cause_acc %.2f meta=%s delta=%.3f reverted=%s",
-                    episode,
-                    episode_reward,
-                    success_rate,
-                    episode_spikes,
-                    avg_nll,
-                    cause_acc,
-                    last_meta["meta_action"],
-                    last_meta["delta"],
-                    last_meta["reverted"],
-                )
-
-            csv_logger.log(
+            metrics_logger.log(
                 {
                     "episode": episode,
                     "return": episode_reward,
@@ -511,7 +498,7 @@ def train_smsa(
         if episode == forget_episode and not forget_triggered:
             recover_threshold = 0.9
             policy.reset_parameters()
-            meta_recent_steps = meta_effect_span
+            meta_cause_steps = cause_flag_span
             visit_counts.clear()
             forget_triggered = True
             episodes_since_forget = 0
@@ -552,6 +539,8 @@ def train_smsa(
                 env_cfg=baseline_env_cfg,
                 threshold=recover_threshold,
                 use_dream=False,
+                policy_alpha=policy_alpha,
+                policy_beta=policy_beta,
             )
             random.setstate(rng_state)
             logger.info(
@@ -610,16 +599,22 @@ def train_smsa(
         cause_tail,
     )
     meta_ratio = meta.positive_ratio()
+    short_ratio = meta_short_ratio()
     logger.info(
-        "Meta adaptations: attempts=%d positive_ratio=%.2f",
+        "Meta adaptations: attempts=%d positive_ratio=%.2f short_window=%.2f",
         meta.attempts,
         meta_ratio,
+        short_ratio,
     )
     if validate:
         assert end_nll < start_nll, "Self-Model NLL 未下降。"
         assert cause_tail > 0.7, "自因分类准确率未超过 0.7。"
         if meta.attempts > 0:
             assert meta_ratio >= 0.5, "自改后 Δ 回报为正的比例未达到 50%。"
+            if recent_meta_outcomes:
+                assert (
+                    short_ratio >= 0.5
+                ), "近期自改 Δ>0 的比例未达到 50%。"
         if forget_triggered:
             if dream_recovery_episode is None:
                 raise AssertionError("梦想回放未能恢复至目标成功率。")
