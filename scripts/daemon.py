@@ -54,6 +54,27 @@ def append_daemon_row(row: Dict[str, object]) -> None:
         writer.writerow(payload)
 
 
+def read_last_iteration(path: Path = DAEMON_CSV_PATH) -> int:
+    """Load the last recorded iteration so numbering stays monotonic."""
+    if not path.exists():
+        return 0
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            last_iteration = 0
+            for row in reader:
+                raw_value = (row.get("iteration") or "").strip()
+                if not raw_value or raw_value == "iteration":
+                    continue
+                try:
+                    last_iteration = int(raw_value)
+                except ValueError:
+                    continue
+            return last_iteration
+    except FileNotFoundError:
+        return 0
+
+
 class SimpleAutoAgent:
     def __init__(self) -> None:
         self.eta = 0.05
@@ -259,10 +280,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     }
     scheduler = Scheduler()
     auto_loop = AutoAdaptLoop()
-    iteration = 0
+    iteration = read_last_iteration()
+    start_iteration = iteration
     try:
         while True:
-            if args.max_iterations and iteration >= args.max_iterations:
+            if args.max_iterations and (iteration - start_iteration) >= args.max_iterations:
                 break
             selection = scheduler.select_next()
             task = str(selection)
