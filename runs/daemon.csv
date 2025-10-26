@@ -1,0 +1,4 @@
+timestamp,iteration,task,reward,energy_penalty,metric_a,metric_b,spikes,meta_action,delta,reverted,note
+2025-10-26T10:48:08Z,1,rl,7.390624,0.090800,7.390624,0.000000,90.800000,,0.000000,False,rl episodes=5
+2025-10-26T10:48:20Z,2,lm,-4.357564,0.010142,4.357564,78.066738,20.283679,,0.000000,False,lm lines=50
+2025-10-26T10:48:21Z,3,autoadapt,-0.046000,0.000000,,,0.000000,vth_down,-0.046000,True,"[meta] ep001 action=vth_down delta=-0.046 (reverted, pos=0.00) info=v_th=0.550"

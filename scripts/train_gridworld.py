@@ -443,6 +443,47 @@ def train_gridworld(
     }
 
 
+def train_once(
+    episodes: int = 10,
+    seed: int | None = None,
+    *,
+    env_cfg: GridWorldConfig | None = None,
+) -> Tuple[float, float, float]:
+    """Lightweight train loop used by background daemons."""
+    env_cfg = env_cfg or GridWorldConfig()
+    agent = EpropGridAgent(
+        state_size=env_cfg.size * env_cfg.size,
+        inner_steps=12,
+        eta_e=0.035,
+        lam_e=0.9,
+        intrinsic_beta=0.35,
+        seed=seed,
+    )
+    visit_counts: DefaultDict[int, int] = collections.defaultdict(int)
+    total_reward = 0.0
+    total_spikes = 0.0
+    successes = 0
+    for episode in range(1, episodes + 1):
+        env_seed = (seed or 0) * 2029 + episode * 131
+        env = env_cfg.make_env(seed=env_seed)
+        agent.reseed(env_seed)
+        reward, success, spikes, _ = _run_episode(
+            agent,
+            env,
+            visit_counts,
+            training=True,
+        )
+        total_reward += reward
+        total_spikes += spikes
+        if success:
+            successes += 1
+    count = float(max(episodes, 1))
+    avg_return = total_reward / count
+    success_rate = successes / count
+    avg_spikes = total_spikes / count
+    return avg_return, success_rate, avg_spikes
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="GridWorld 在线 e-prop 训练。")
     parser.add_argument("--episodes", type=int, default=80, help="训练回合数")

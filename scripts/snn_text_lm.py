@@ -27,6 +27,16 @@ from snn.selfmodel import SelfModel
 TOKEN_BOS = "<bos>"
 TOKEN_EOS = "<eos>"
 TOKEN_UNK = "<unk>"
+SYNTHETIC_LINES = [
+    "苹果是一种水果，经常出现在早餐。",
+    "蜂蜜属于天然食材，味道清甜。",
+    "云计算平台是现代企业的重要工具。",
+    "光合作用帮助植物把阳光变成能量。",
+    "地球自转让昼夜交替出现。",
+    "长江被视为中国的母亲河。",
+    "项目计划让团队保持节奏一致。",
+    "芝士在烘焙菜单里常被使用。",
+]
 
 
 def expand_inputs(patterns: Sequence[str]) -> List[str]:
@@ -911,6 +921,43 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dream-max-len", type=int, default=5, help="Maximum dream sequence length.")
     parser.add_argument("--replay-warmup", type=int, default=64, help="Minimum sequences before enabling replay/dream.")
     return parser.parse_args(argv)
+
+
+def train_lines(num_lines: int, seed: int | None = None) -> Tuple[float, float, float]:
+    """Lightweight LM training used by daemon loops."""
+    rng = random.Random(seed)
+    lines = [
+        list(rng.choice(SYNTHETIC_LINES))
+        for _ in range(max(1, num_lines))
+    ]
+    vocab = Vocab.build(lines, max_size=160)
+    model = TextSNNLM(
+        vocab_size=len(vocab.id_to_token),
+        input_dim=96,
+        hidden_size=48,
+        k_proj=2,
+        inner_steps=8,
+        hidden_lr=0.05,
+        readout_lr=0.08,
+    )
+    total_loss = 0.0
+    total_tokens = 0
+    total_spikes = 0.0
+    for tokens in lines:
+        seq = [TOKEN_BOS] + tokens + [TOKEN_EOS]
+        model.reset_temporal()
+        for idx in range(len(seq) - 1):
+            current = seq[idx]
+            nxt = seq[idx + 1]
+            state = model.forward(current)
+            total_spikes += sum(state.hidden_rates) * model.inner_steps
+            loss = model.update(state, vocab.encode(nxt), train=True)
+            total_loss += loss
+            total_tokens += 1
+    avg_loss = total_loss / float(max(1, total_tokens))
+    ppl = math.exp(min(20.0, avg_loss))
+    avg_spikes = total_spikes / float(max(1, total_tokens))
+    return avg_loss, ppl, avg_spikes
 
 
 def main(argv: Sequence[str] | None = None) -> None:
