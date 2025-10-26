@@ -7,3 +7,5 @@ timestamp,iteration,task,reward,energy_penalty,metric_a,metric_b,spikes,meta_act
 2025-10-26T11:55:55Z,6,rl,4.190011,0.067450,4.190011,0.400000,67.450000,,0.000000,False,rl episodes=20
 2025-10-26T11:58:03Z,7,lm,-3.083391,0.029831,3.083391,21.832311,59.662469,,0.000000,False,lm lines=500
 2025-10-26T11:58:13Z,8,autoadapt,-0.035000,0.000000,,,0.000000,vth_up,-0.035000,True,"[meta] ep001 action=vth_up delta=-0.035 (reverted, pos=0.00) info=v_th=0.650"
+2025-10-26T13:16:05Z,9,lm,-10.390140,0.012014,3.607106,36.859221,24.027885,,-10.390140,False,lm lines=60; files=corpus_garden.txt/data×60
+2025-10-26T13:16:40Z,10,lm,-11.500794,0.012488,3.787632,44.151715,24.976724,,-11.500794,False,lm lines=60; files=corpus_finance.txt/data×60

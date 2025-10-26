@@ -5,15 +5,19 @@ from __future__ import annotations
 import argparse
 import collections
 import copy
+import csv
 import glob
 import gzip
+import json
 import math
 import os
 import random
 import sys
+import time
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Deque, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import TYPE_CHECKING, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 # Ensure repository root on path for imports.
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -23,6 +27,9 @@ if ROOT not in sys.path:
 from snn.dense import DenseLIF, LinearTemporalUnit
 from snn.lif import LIFParams, fast_sigmoid_surrogate
 from snn.selfmodel import SelfModel
+
+if TYPE_CHECKING:
+    from tools.corpus import DomainSampler
 
 TOKEN_BOS = "<bos>"
 TOKEN_EOS = "<eos>"
@@ -37,6 +44,146 @@ SYNTHETIC_LINES = [
     "项目计划让团队保持节奏一致。",
     "芝士在烘焙菜单里常被使用。",
 ]
+
+LM_CSV_PATH = Path("runs/lm.csv")
+LM_FIELDS = [
+    "timestamp",
+    "lines",
+    "train_loss",
+    "train_ppl",
+    "valid_ppl",
+    "delta_ppl",
+    "files",
+    "topics",
+]
+
+
+def _ensure_lm_csv() -> None:
+    LM_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not LM_CSV_PATH.exists():
+        with LM_CSV_PATH.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=LM_FIELDS)
+            writer.writeheader()
+
+
+def _read_last_valid_ppl() -> Optional[float]:
+    if not LM_CSV_PATH.exists():
+        return None
+    try:
+        with LM_CSV_PATH.open("r", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            last_row = None
+            for row in reader:
+                last_row = row
+    except (OSError, csv.Error):
+        return None
+    if not last_row:
+        return None
+    value = last_row.get("valid_ppl")
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_counts(counts: Mapping[str, int], *, short: bool = False) -> str:
+    if not counts:
+        return "synthetic"
+    items = []
+    for key, value in sorted(counts.items(), key=lambda item: item[0]):
+        label = Path(key).name if short else key
+        items.append(f"{label}:{value}")
+    return "|".join(items)
+
+
+def _append_lm_row(
+    *,
+    lines: int,
+    avg_loss: float,
+    train_ppl: float,
+    valid_ppl: float,
+    delta_ppl: float,
+    files: Mapping[str, int],
+    topics: Mapping[str, int],
+) -> None:
+    _ensure_lm_csv()
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    row = {
+        "timestamp": timestamp,
+        "lines": lines,
+        "train_loss": f"{avg_loss:.6f}",
+        "train_ppl": f"{train_ppl:.6f}",
+        "valid_ppl": f"{valid_ppl:.6f}",
+        "delta_ppl": f"{delta_ppl:.6f}",
+        "files": _format_counts(files, short=True),
+        "topics": _format_counts(topics, short=True),
+    }
+    with LM_CSV_PATH.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=LM_FIELDS)
+        writer.writerow(row)
+
+
+def _load_validation_sequences(state_path: Path, limit: int = 128) -> List[List[str]]:
+    try:
+        with state_path.open("r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    files = [
+        Path(path)
+        for path, meta in state.get("files", {}).items()
+        if meta.get("split") == "valid"
+    ]
+    if not files:
+        return []
+    per_file = max(1, limit // len(files))
+    sequences: List[List[str]] = []
+    for file_path in files:
+        try:
+            opener = gzip.open if file_path.suffix == ".gz" else open
+            with opener(file_path, "rt", encoding="utf-8", errors="ignore") as handle:
+                for idx, line in enumerate(handle):
+                    tokens = tokenize(line.rstrip("\n"))
+                    if tokens:
+                        sequences.append(tokens)
+                    if idx + 1 >= per_file or len(sequences) >= limit:
+                        break
+        except OSError:
+            continue
+        if len(sequences) >= limit:
+            break
+    return sequences
+
+
+def _synthetic_valid_sequences(count: int = 32) -> List[List[str]]:
+    seqs: List[List[str]] = []
+    for idx in range(count):
+        text = SYNTHETIC_LINES[idx % len(SYNTHETIC_LINES)]
+        seqs.append(tokenize(text))
+    return seqs
+
+
+def _evaluate_ppl(
+    model: TextSNNLM,
+    vocab: Vocab,
+    sequences: Sequence[Sequence[str]],
+) -> float:
+    if not sequences:
+        return float("inf")
+    total_loss = 0.0
+    total_tokens = 0
+    for tokens in sequences:
+        seq = [TOKEN_BOS] + list(tokens) + [TOKEN_EOS]
+        model.reset_temporal()
+        for idx in range(len(seq) - 1):
+            state = model.forward(seq[idx])
+            loss = model.update(state, vocab.encode(seq[idx + 1]), train=False)
+            total_loss += loss
+            total_tokens += 1
+    if total_tokens == 0:
+        return float("inf")
+    avg = total_loss / float(total_tokens)
+    return math.exp(min(20.0, avg))
 
 
 def expand_inputs(patterns: Sequence[str]) -> List[str]:
@@ -923,14 +1070,61 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def train_lines(num_lines: int, seed: int | None = None) -> Tuple[float, float, float]:
+def train_lines(
+    num_lines: int,
+    seed: int | None = None,
+    *,
+    sampler: "DomainSampler | None" = None,
+    valid_interval: int = 200,
+) -> Dict[str, object]:
     """Lightweight LM training used by daemon loops."""
     rng = random.Random(seed)
-    lines = [
-        list(rng.choice(SYNTHETIC_LINES))
-        for _ in range(max(1, num_lines))
-    ]
-    vocab = Vocab.build(lines, max_size=160)
+    target_lines = max(1, num_lines)
+    collected: List[List[str]] = []
+    file_counts: Dict[str, int] = {}
+    topic_counts: Dict[str, int] = {}
+    file_topics: Dict[str, str] = {}
+
+    while len(collected) < target_lines:
+        remaining = target_lines - len(collected)
+        chunk = min(64, remaining)
+        if sampler is None:
+            sample = tokenize(rng.choice(SYNTHETIC_LINES))
+            collected.append(sample)
+            file_counts["synthetic"] = file_counts.get("synthetic", 0) + 1
+            topic_counts["synthetic"] = topic_counts.get("synthetic", 0) + 1
+            continue
+        try:
+            batch_lines = list(sampler.next_batch(chunk))
+        except RuntimeError:
+            sampler = None
+            continue
+        if not batch_lines:
+            sampler = None
+            continue
+        try:
+            meta = sampler.metadata_for(sampler.last_file())
+        except Exception:
+            meta = {}
+        file_path = meta.get("path") or sampler.last_file() or "unknown"
+        topic = meta.get("topic", "default")
+        file_counts[file_path] = file_counts.get(file_path, 0) + len(batch_lines)
+        topic_counts[topic] = topic_counts.get(topic, 0) + len(batch_lines)
+        file_topics[file_path] = topic
+        for line in batch_lines:
+            tokens = tokenize(line)
+            if tokens:
+                collected.append(tokens)
+        if len(collected) >= target_lines:
+            break
+
+    if not collected:
+        collected = [tokenize(rng.choice(SYNTHETIC_LINES)) for _ in range(target_lines)]
+        file_counts = {"synthetic": target_lines}
+        topic_counts = {"synthetic": target_lines}
+        file_topics = {"synthetic": "synthetic"}
+
+    vocab = Vocab.build(collected, max_size=160)
     model = TextSNNLM(
         vocab_size=len(vocab.id_to_token),
         input_dim=96,
@@ -940,24 +1134,93 @@ def train_lines(num_lines: int, seed: int | None = None) -> Tuple[float, float, 
         hidden_lr=0.05,
         readout_lr=0.08,
     )
+
+    state_attr = getattr(sampler, "state_path", None)
+    state_path = Path(state_attr) if state_attr else None
+    valid_sequences: List[List[str]] = []
+    if state_path and state_path.exists():
+        valid_sequences = _load_validation_sequences(state_path)
+    if not valid_sequences:
+        valid_sequences = _synthetic_valid_sequences(min(32, len(collected)))
+
     total_loss = 0.0
     total_tokens = 0
     total_spikes = 0.0
-    for tokens in lines:
+    lines_trained = 0
+    lines_since_eval = 0
+    valid_interval = max(1, min(valid_interval, target_lines))
+    prev_logged_ppl = _read_last_valid_ppl()
+    last_valid = None
+    last_delta = 0.0
+
+    for tokens in collected:
         seq = [TOKEN_BOS] + tokens + [TOKEN_EOS]
         model.reset_temporal()
         for idx in range(len(seq) - 1):
-            current = seq[idx]
-            nxt = seq[idx + 1]
-            state = model.forward(current)
+            state = model.forward(seq[idx])
             total_spikes += sum(state.hidden_rates) * model.inner_steps
-            loss = model.update(state, vocab.encode(nxt), train=True)
+            loss = model.update(state, vocab.encode(seq[idx + 1]), train=True)
             total_loss += loss
             total_tokens += 1
+        lines_trained += 1
+        lines_since_eval += 1
+        if lines_since_eval >= valid_interval:
+            last_valid = _evaluate_ppl(model, vocab, valid_sequences)
+            avg_loss = total_loss / float(max(1, total_tokens))
+            train_ppl = math.exp(min(20.0, avg_loss))
+            delta = (
+                (prev_logged_ppl - last_valid)
+                if (prev_logged_ppl is not None and math.isfinite(last_valid))
+                else 0.0
+            )
+            _append_lm_row(
+                lines=lines_trained,
+                avg_loss=avg_loss,
+                train_ppl=train_ppl,
+                valid_ppl=last_valid,
+                delta_ppl=delta,
+                files=file_counts,
+                topics=topic_counts,
+            )
+            prev_logged_ppl = last_valid
+            last_delta = delta
+            lines_since_eval = 0
+
+    if lines_since_eval > 0 or last_valid is None:
+        last_valid = _evaluate_ppl(model, vocab, valid_sequences)
+        avg_loss = total_loss / float(max(1, total_tokens))
+        train_ppl = math.exp(min(20.0, avg_loss))
+        delta = (
+            (prev_logged_ppl - last_valid)
+            if (prev_logged_ppl is not None and math.isfinite(last_valid))
+            else 0.0
+        )
+        _append_lm_row(
+            lines=lines_trained,
+            avg_loss=avg_loss,
+            train_ppl=train_ppl,
+            valid_ppl=last_valid,
+            delta_ppl=delta,
+            files=file_counts,
+            topics=topic_counts,
+        )
+        prev_logged_ppl = last_valid
+        last_delta = delta
+
     avg_loss = total_loss / float(max(1, total_tokens))
-    ppl = math.exp(min(20.0, avg_loss))
+    train_ppl = math.exp(min(20.0, avg_loss))
     avg_spikes = total_spikes / float(max(1, total_tokens))
-    return avg_loss, ppl, avg_spikes
+    return {
+        "avg_loss": avg_loss,
+        "ppl": train_ppl,
+        "avg_spikes": avg_spikes,
+        "valid_ppl": last_valid if last_valid is not None else float("inf"),
+        "delta_ppl": last_delta,
+        "files": file_counts,
+        "topics": topic_counts,
+        "file_topics": file_topics,
+        "lines": lines_trained,
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> None:

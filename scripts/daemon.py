@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 from meta.autoadapt import MetaLearner
 from scripts.snn_text_lm import train_lines
 from scripts.train_gridworld import train_once
+from tools.corpus import DomainSampler
 from tools.reporter import write_episode_report
 from tools.scheduler import Scheduler
 
@@ -37,6 +38,7 @@ DAEMON_FIELDS = [
     "note",
 ]
 
+LM_STATE_PATH = Path("runs/corpus_state.json")
 
 def ensure_daemon_csv() -> None:
     DAEMON_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -52,6 +54,16 @@ def append_daemon_row(row: Dict[str, object]) -> None:
     with DAEMON_CSV_PATH.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=DAEMON_FIELDS)
         writer.writerow(payload)
+
+
+def build_domain_sampler() -> DomainSampler | None:
+    """Instantiate a DomainSampler if corpus state is available."""
+    LM_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        return DomainSampler(state_json=LM_STATE_PATH, split="train", window=10, ucb_c=0.5)
+    except Exception as exc:
+        print(f"[lm] 无法构建 DomainSampler: {exc}")
+        return None
 
 
 def read_last_iteration(path: Path = DAEMON_CSV_PATH) -> int:
@@ -174,9 +186,33 @@ def run_rl(episodes: int) -> Dict[str, object]:
     }
 
 
-def run_lm(num_lines: int) -> Dict[str, object]:
-    avg_loss, ppl, spikes = train_lines(num_lines=num_lines, seed=int(time.time()) & 0xFFFF)
-    reward = -avg_loss
+def _summarize_domains(files: Dict[str, int], file_topics: Dict[str, str]) -> str:
+    if not files:
+        return "synthetic×?"
+    summary = []
+    for path, count in sorted(files.items(), key=lambda item: (-item[1], item[0])):
+        topic = file_topics.get(path, "")
+        topic_text = f"/{topic}" if topic and topic != "default" else ""
+        summary.append(f"{Path(path).name}{topic_text}×{count}")
+    return "，".join(summary)
+
+
+def run_lm(num_lines: int, sampler: DomainSampler | None = None) -> Dict[str, object]:
+    stats = train_lines(
+        num_lines=num_lines,
+        seed=int(time.time()) & 0xFFFF,
+        sampler=sampler,
+        valid_interval=max(50, num_lines // 2),
+    )
+    avg_loss = float(stats.get("avg_loss", 0.0))
+    ppl = float(stats.get("ppl", 0.0))
+    spikes = float(stats.get("avg_spikes", 0.0))
+    valid_ppl = float(stats.get("valid_ppl", ppl))
+    delta_ppl = float(stats.get("delta_ppl", 0.0))
+    files = {str(k): int(v) for k, v in stats.get("files", {}).items()}
+    file_topics = {str(k): str(v) for k, v in stats.get("file_topics", {}).items()}
+    domain_text = _summarize_domains(files, file_topics)
+    reward = delta_ppl
     energy_penalty = spikes * 0.0005
     return {
         "task": "lm",
@@ -184,13 +220,16 @@ def run_lm(num_lines: int) -> Dict[str, object]:
         "energy_penalty": energy_penalty,
         "avg_loss": avg_loss,
         "ppl": ppl,
+        "valid_ppl": valid_ppl,
+        "delta_ppl": delta_ppl,
         "spikes": spikes,
         "meta_action": None,
-        "delta": 0.0,
+        "delta": delta_ppl,
         "reverted": False,
-        "cause_prob_self": max(0.0, min(1.0, 0.5 + 0.1 * (1.0 / (1.0 + ppl)))),
-        "next_plan": f"继续 LM {num_lines} 行以压低困惑度",
-        "note": f"lm lines={num_lines}",
+        "domains_summary": domain_text,
+        "cause_prob_self": max(0.0, min(1.0, 0.5 + 0.1 * (1.0 / (1.0 + valid_ppl)))),
+        "next_plan": f"继续 LM {num_lines} 行，巩固 Δppl {delta_ppl:+.3f}",
+        "note": f"lm lines={num_lines}; files={domain_text}",
     }
 
 
@@ -213,12 +252,15 @@ def build_report_payload(iteration: int, metrics: Dict[str, object]) -> Dict[str
         "avg_return": metrics.get("avg_return"),
         "success_rate": metrics.get("success_rate"),
         "ppl": metrics.get("ppl"),
+        "valid_ppl": metrics.get("valid_ppl"),
         "energy": metrics.get("spikes"),
         "meta_action": metrics.get("meta_action"),
         "delta": metrics.get("delta"),
+        "delta_ppl": metrics.get("delta_ppl"),
         "reverted": metrics.get("reverted"),
         "cause_prob_self": metrics.get("cause_prob_self"),
         "next_plan": metrics.get("next_plan"),
+        "domains_summary": metrics.get("domains_summary"),
     }
 
 
@@ -230,6 +272,8 @@ def log_daemon_metrics(iteration: int, metrics: Dict[str, object]) -> None:
     metric_b_value = metrics.get("success_rate")
     if metric_b_value is None:
         metric_b_value = metrics.get("ppl")
+    if metric_b_value is None:
+        metric_b_value = metrics.get("valid_ppl")
     append_daemon_row(
         {
             "timestamp": timestamp,
@@ -280,6 +324,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     }
     scheduler = Scheduler()
     auto_loop = AutoAdaptLoop()
+    lm_sampler = build_domain_sampler()
     iteration = read_last_iteration()
     start_iteration = iteration
     try:
@@ -293,7 +338,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             if task == "rl":
                 metrics = run_rl(args.rl_episodes)
             elif task == "lm":
-                metrics = run_lm(args.lm_lines)
+                metrics = run_lm(args.lm_lines, sampler=lm_sampler)
             else:
                 metrics = run_autoadapt(auto_loop)
             scheduler.update(task, metrics["reward"], energy_penalty=metrics.get("energy_penalty", 0.0))

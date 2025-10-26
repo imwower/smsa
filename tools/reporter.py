@@ -56,14 +56,27 @@ def write_episode_report(path: str | Path, data: Mapping[str, object]) -> None:
     )
     plan = str(data.get("next_plan", "未指定后续计划"))
     cause_text = f"Self-Model 预测自因概率 {cause:.2f}" if isinstance(cause, (int, float)) else "Self-Model 自因概率未知"
-    lines = [
-        f"### Episode {episode} · 任务：{task}",
-        f"- 核心指标：{indicators}",
-        f"- 本次自改：{meta_text}",
-        f"- {cause_text}",
-        f"- 后续计划：{plan}",
-        "",
-    ]
+    domain_info = str(data.get("domains_summary") or "").strip()
+    delta_ppl = data.get("delta_ppl")
+    extra_line = None
+    if domain_info or (task == "lm" and isinstance(delta_ppl, (int, float))):
+        parts: List[str] = []
+        if domain_info:
+            parts.append(f"语料学习：{domain_info}")
+        if isinstance(delta_ppl, (int, float)):
+            parts.append(f"验证困惑度改善 Δ{delta_ppl:+.3f}")
+        extra_line = "- " + "，".join(parts)
+    lines = [f"### Episode {episode} · 任务：{task}", f"- 核心指标：{indicators}"]
+    if extra_line:
+        lines.append(extra_line)
+    lines.extend(
+        [
+            f"- 本次自改：{meta_text}",
+            f"- {cause_text}",
+            f"- 后续计划：{plan}",
+            "",
+        ]
+    )
     content = "\n".join(lines)
     with file_path.open("a", encoding="utf-8") as handle:
         handle.write(content)
