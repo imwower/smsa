@@ -121,6 +121,21 @@ _RECIPES: Dict[str, List[PatchRecipe]] = {
 }
 
 
+def _normalize_patch_id(patch_id: str) -> str:
+    """宽松接受别名：
+    - 将第一个 '_' 或 '-' 视为命名空间分隔符 ':'。
+    - 统一为小写。
+    例如：'surrogate_rect'、'surrogate-rect' → 'surrogate:rect'
+    """
+    pid = patch_id.strip().lower()
+    if ':' not in pid:
+        for sep in ('_', '-'):
+            if sep in pid:
+                pid = pid.replace(sep, ':', 1)
+                break
+    return pid
+
+
 def _read_text(path: Path) -> str:
     with path.open("r", encoding="utf-8") as fh:
         return fh.read()
@@ -194,9 +209,10 @@ def apply_patch(patch_id: str) -> Tuple[List[str], Dict[str, str]]:
 
     若锚点缺失或补丁策略非法，记录日志并抛出异常。
     """
-    recipes = _RECIPES.get(patch_id)
+    pid = _normalize_patch_id(patch_id)
+    recipes = _RECIPES.get(pid)
     if not recipes:
-        _log(f"apply_patch: 未知 patch_id={patch_id}")
+        _log(f"apply_patch: 未知 patch_id={patch_id} (normalized={pid})")
         raise KeyError(f"不支持的 patch: {patch_id}")
 
     timestamp = _dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -245,7 +261,7 @@ def apply_patch(patch_id: str) -> Tuple[List[str], Dict[str, str]]:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     _LAST_CONTEXT.clear()
     _LAST_CONTEXT.update({
-        "patch_id": patch_id,
+        "patch_id": pid,
         "timestamp": timestamp,
         "changed": changed,
         "backups": backups,
