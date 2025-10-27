@@ -26,7 +26,10 @@ def triangular_surrogate(u: float, width: float = 1.0) -> float:
     return (width - abs(u)) / width
 
 
+# AUTOPATCH SURROGATE START
+# 使用矩形窗的替代导数；窗口宽度 ~ 1/slope
 def fast_sigmoid_surrogate(u: float, slope: float = 2.0) -> float:
-    """快速 Sigmoid 替代导数。"""
-    denom = 1.0 + slope * abs(u)
-    return slope / (denom * denom)
+    """矩形窗替代导数：在小邻域给常数梯度。"""
+    width = 1.0 / max(1e-6, slope)
+    return (slope if -width <= u <= width else 0.0)
+# AUTOPATCH SURROGATE END

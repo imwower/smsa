@@ -80,6 +80,20 @@ _RECIPES: Dict[str, List[PatchRecipe]] = {
             ),
         )
     ],
+    # 切换为矩形窗替代导数：在 |u| <= (1/slope) 内为常数，否则为 0
+    "surrogate:rect": [
+        PatchRecipe(
+            file=SURROGATE_FILE,
+            strategy="anchor-replace",
+            content=(
+                "# 使用矩形窗的替代导数；窗口宽度 ~ 1/slope\n"
+                "def fast_sigmoid_surrogate(u: float, slope: float = 2.0) -> float:\n"
+                "    \"\"\"矩形窗替代导数：在小邻域给常数梯度。\"\"\"\n"
+                "    width = 1.0 / max(1e-6, slope)\n"
+                "    return (slope if -width <= u <= width else 0.0)\n"
+            ),
+        )
+    ],
     # 在 dense.py 的锚点中设定 e-prop 默认学习率/衰减（需通过静态检查范围）
     "defaults:eta0.03_lam0.9": [
         PatchRecipe(
@@ -454,4 +468,3 @@ __all__ = [
     "ab_evaluate",
     "safe_apply_and_eval",
 ]
-
