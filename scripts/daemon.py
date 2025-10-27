@@ -1,4 +1,4 @@
-"""Background daemon that cycles through RL/LM/Meta tasks."""
+"""Background daemon that cycles through RL/LM/Meta/Post tasks."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 from meta.autoadapt import MetaLearner
 from scripts.snn_text_lm import train_lines
+from scripts.spike_writer import _write_feed, spike_generate
 from scripts.train_gridworld import train_once
 from tools.corpus import DomainSampler
 from tools.reporter import write_episode_report
@@ -39,6 +40,12 @@ DAEMON_FIELDS = [
 ]
 
 LM_STATE_PATH = Path("runs/corpus_state.json")
+ENERGY_COEFF_RL = 0.001
+ENERGY_COEFF_LM = 0.0005
+ENERGY_COEFF_POST = 0.0002
+
+_RL_HISTORY: Dict[str, float | None] = {"avg_return": None}
+
 
 def ensure_daemon_csv() -> None:
     DAEMON_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -169,16 +176,19 @@ class AutoAdaptLoop:
 
 def run_rl(episodes: int) -> Dict[str, object]:
     avg_return, success_rate, spikes = train_once(episodes=episodes, seed=int(time.time()) & 0xFFFF)
-    energy_penalty = spikes * 0.001
+    prev = _RL_HISTORY.get("avg_return")
+    delta_return = avg_return - prev if isinstance(prev, (int, float)) else avg_return
+    _RL_HISTORY["avg_return"] = avg_return
+    energy_penalty = spikes * ENERGY_COEFF_RL
     return {
         "task": "rl",
-        "reward": avg_return,
+        "reward": delta_return,
         "energy_penalty": energy_penalty,
         "avg_return": avg_return,
         "success_rate": success_rate,
         "spikes": spikes,
         "meta_action": None,
-        "delta": 0.0,
+        "delta": delta_return,
         "reverted": False,
         "cause_prob_self": min(1.0, max(0.0, success_rate)),
         "next_plan": f"继续 RL {episodes} 回合以提升成功率",
@@ -212,8 +222,8 @@ def run_lm(num_lines: int, sampler: DomainSampler | None = None) -> Dict[str, ob
     files = {str(k): int(v) for k, v in stats.get("files", {}).items()}
     file_topics = {str(k): str(v) for k, v in stats.get("file_topics", {}).items()}
     domain_text = _summarize_domains(files, file_topics)
-    reward = delta_ppl
-    energy_penalty = spikes * 0.0005
+    reward = -delta_ppl
+    energy_penalty = spikes * ENERGY_COEFF_LM
     return {
         "task": "lm",
         "reward": reward,
@@ -245,6 +255,33 @@ def run_autoadapt(loop: AutoAdaptLoop) -> Dict[str, object]:
     return payload
 
 
+def run_post(length: int, *, topic_hint: str | None = None, temperature: float = 1.0) -> Dict[str, object]:
+    result = spike_generate(
+        max_len=length,
+        seed_text="",
+        temperature=temperature,
+        topic_hint=topic_hint,
+    )
+    text_path = _write_feed(result, topic_hint, length, temperature)
+    reward = result.readability
+    energy_penalty = result.spike_estimate * ENERGY_COEFF_POST
+    return {
+        "task": "post",
+        "reward": reward,
+        "energy_penalty": energy_penalty,
+        "readability": result.readability,
+        "context": result.context,
+        "spikes": result.spike_estimate,
+        "text_path": str(text_path),
+        "meta_action": None,
+        "delta": result.readability,
+        "reverted": False,
+        "cause_prob_self": max(0.1, min(0.9, result.readability)),
+        "next_plan": "根据评分挑选优秀内容发布，并准备下一次主题草稿。",
+        "note": f"post feed={text_path.name}",
+    }
+
+
 def build_report_payload(iteration: int, metrics: Dict[str, object]) -> Dict[str, object]:
     return {
         "task": metrics.get("task", "unknown"),
@@ -261,6 +298,8 @@ def build_report_payload(iteration: int, metrics: Dict[str, object]) -> Dict[str
         "cause_prob_self": metrics.get("cause_prob_self"),
         "next_plan": metrics.get("next_plan"),
         "domains_summary": metrics.get("domains_summary"),
+        "readability": metrics.get("readability"),
+        "text_path": metrics.get("text_path"),
     }
 
 
@@ -269,11 +308,15 @@ def log_daemon_metrics(iteration: int, metrics: Dict[str, object]) -> None:
     metric_a_value = metrics.get("avg_return")
     if metric_a_value is None:
         metric_a_value = metrics.get("avg_loss")
+    if metric_a_value is None:
+        metric_a_value = metrics.get("readability")
     metric_b_value = metrics.get("success_rate")
     if metric_b_value is None:
         metric_b_value = metrics.get("ppl")
     if metric_b_value is None:
         metric_b_value = metrics.get("valid_ppl")
+    if metric_b_value is None:
+        metric_b_value = metrics.get("context")
     append_daemon_row(
         {
             "timestamp": timestamp,
@@ -297,12 +340,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--loops",
         type=str,
-        default="rl,lm,autoadapt",
-        help="Comma-separated task list (subset of rl,lm,autoadapt).",
+        default="rl,lm,autoadapt,post",
+        help="Comma-separated task list (subset of rl,lm,autoadapt,post).",
     )
     parser.add_argument("--poll-seconds", type=int, default=30, help="Sleep interval between tasks.")
     parser.add_argument("--rl-episodes", type=int, default=20, help="Episodes per RL call.")
     parser.add_argument("--lm-lines", type=int, default=500, help="Lines per LM update.")
+    parser.add_argument("--post-len", type=int, default=220, help="Maximum characters per post generation.")
     parser.add_argument(
         "--max-iterations",
         type=int,
@@ -319,8 +363,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         allowed = list(Scheduler.TASKS)
     Scheduler.TASKS = tuple(allowed)
     base_budgets = dict(Scheduler.BUDGETS)
+    custom_budgets = {
+        "rl": (args.rl_episodes, "episodes"),
+        "lm": (args.lm_lines, "lines"),
+        "autoadapt": (1, "steps"),
+        "post": (args.post_len, "chars"),
+    }
     Scheduler.BUDGETS = {
-        task: base_budgets.get(task, (1, "units")) for task in allowed
+        task: custom_budgets.get(task, base_budgets.get(task, (1, "units")))
+        for task in allowed
     }
     scheduler = Scheduler()
     auto_loop = AutoAdaptLoop()
@@ -336,12 +387,22 @@ def main(argv: Sequence[str] | None = None) -> None:
             if task not in allowed:
                 continue
             if task == "rl":
-                metrics = run_rl(args.rl_episodes)
+                episodes = int(getattr(selection, "budget", args.rl_episodes))
+                metrics = run_rl(episodes)
             elif task == "lm":
-                metrics = run_lm(args.lm_lines, sampler=lm_sampler)
+                num_lines = int(getattr(selection, "budget", args.lm_lines))
+                metrics = run_lm(num_lines, sampler=lm_sampler)
+            elif task == "post":
+                length = int(getattr(selection, "budget", args.post_len))
+                metrics = run_post(length)
             else:
                 metrics = run_autoadapt(auto_loop)
-            scheduler.update(task, metrics["reward"], energy_penalty=metrics.get("energy_penalty", 0.0))
+            scheduler.update(
+                task,
+                metrics["reward"],
+                energy_penalty=metrics.get("energy_penalty", 0.0),
+                note=metrics.get("note", ""),
+            )
             iteration += 1
             metrics["task"] = task
             log_daemon_metrics(iteration, metrics)
