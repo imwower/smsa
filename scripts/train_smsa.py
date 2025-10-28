@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
 
 from snn.training.smsa import RecoverySummary, train_smsa
 from tools.logger import get_logger, setup_logging
+from tools.config import write_corpus_config_for_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,6 +37,12 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Self-Model 学习信号权重 β",
     )
+    parser.add_argument(
+        "--corpus-path",
+        type=str,
+        default="",
+        help="可选：指定语料文本路径，写入全局配置",
+    )
     return parser.parse_args()
 
 
@@ -43,6 +50,8 @@ def main() -> None:
     args = parse_args()
     setup_logging()
     logger = get_logger(__name__)
+    if args.corpus_path:
+        write_corpus_config_for_path(args.corpus_path)
     summary: RecoverySummary = train_smsa(
         episodes=args.episodes,
         seed=args.seed,

@@ -21,6 +21,7 @@ from snn.dense import DenseLIF, LinearTemporalUnit
 from snn.lif import LIFParams, fast_sigmoid_surrogate, triangular_surrogate
 from snn.policy import PolicyHead
 from tools.logger import EpisodeMetricsLogger, get_logger, setup_logging
+from tools.config import write_corpus_config_for_path
 
 
 def patched_surrogate(u: float, slope: float = 1.5) -> float:
@@ -509,6 +510,12 @@ def parse_args() -> argparse.Namespace:
         default=0.35,
         help="探索新奇奖励系数 β",
     )
+    parser.add_argument(
+        "--corpus-path",
+        type=str,
+        default="",
+        help="可选：指定语料文本路径，写入全局配置",
+    )
     return parser.parse_args()
 
 
@@ -516,6 +523,8 @@ def main() -> None:
     args = parse_args()
     setup_logging()
     logger = get_logger(__name__)
+    if args.corpus_path:
+        write_corpus_config_for_path(args.corpus_path)
     env_cfg = GridWorldConfig(
         slip_prob=args.slip_prob,
         step_cost=args.step_cost,

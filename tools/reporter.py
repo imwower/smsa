@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Sequence
 from tools.logger import CsvLogger
+from tools.config import find_train_corpus_from_config
 import statistics
 
 
@@ -64,6 +65,12 @@ def write_episode_report(path: str | Path, data: Mapping[str, object]) -> None:
     )
     calib_note = str(data.get("calibration_note") or "").strip()
     domain_info = str(data.get("domains_summary") or "").strip()
+    # 语料来源（优先来自调用方，其次来自全局配置）
+    corpus_path = str(data.get("corpus_path") or "").strip()
+    if not corpus_path:
+        cfg_corpus = find_train_corpus_from_config()
+        if cfg_corpus:
+            corpus_path = str(cfg_corpus)
     delta_ppl = data.get("delta_ppl")
     extra_line = None
     if domain_info or (task == "lm" and isinstance(delta_ppl, (int, float))):
@@ -76,6 +83,8 @@ def write_episode_report(path: str | Path, data: Mapping[str, object]) -> None:
     lines = [f"### Episode {episode} · 任务：{task}", f"- 核心指标：{indicators}"]
     if extra_line:
         lines.append(extra_line)
+    if corpus_path:
+        lines.append(f"- 语料来源：{corpus_path}")
     lines.extend(
         [
             f"- 本次自改：{meta_text}",

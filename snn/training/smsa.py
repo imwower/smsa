@@ -18,6 +18,7 @@ from snn.lif import LIFParams
 from snn.selfmodel import SelfModel
 from snn.training.gridworld_meta import GridWorldConfig
 from tools.logger import EpisodeMetricsLogger, get_logger
+from tools.config import find_train_corpus_from_config
 from tools.reporter import (
     append_calibration_row,
     compute_calibration_from_metrics,
@@ -535,6 +536,7 @@ def train_smsa(
                     "delta": last_meta["delta"],
                     "reverted": last_meta["reverted"],
                     "cause_prob_self": cause_prob_self,
+                    "corpus_path": find_train_corpus_from_config() or "",
                     "next_plan": "继续探索并校准自我模型",
                     "calibration_note": note,
                 },

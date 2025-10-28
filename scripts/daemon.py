@@ -19,6 +19,8 @@ from scripts.snn_text_lm import train_lines
 from scripts.spike_writer import _write_feed, spike_generate
 from scripts.train_gridworld import train_once
 from tools.corpus import DomainSampler
+from tools.config import write_corpus_config_for_path, find_train_corpus_from_config
+import json
 from tools.reporter import write_episode_report
 from tools.scheduler import Scheduler
 
@@ -63,14 +65,40 @@ def append_daemon_row(row: Dict[str, object]) -> None:
         writer.writerow(payload)
 
 
-def build_domain_sampler() -> DomainSampler | None:
-    """Instantiate a DomainSampler if corpus state is available."""
+def build_domain_sampler(corpus_path: str | None = None) -> DomainSampler | None:
+    """Instantiate a DomainSampler and register corpus files from config or explicit path."""
     LM_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
-        return DomainSampler(state_json=LM_STATE_PATH, split="train", window=10, ucb_c=0.5)
+        sampler = DomainSampler(state_json=LM_STATE_PATH, split="train", window=10, ucb_c=0.5)
     except Exception as exc:
         print(f"[lm] 无法构建 DomainSampler: {exc}")
         return None
+
+    # 1) 显式参数优先
+    if corpus_path:
+        try:
+            sampler.register(corpus_path, split="train")
+        except Exception as exc:
+            print(f"[lm] 注册语料失败: {corpus_path} err={exc}")
+        return sampler
+
+    # 2) 读取全局配置
+    train_path = find_train_corpus_from_config()
+    if train_path:
+        try:
+            sampler.register(train_path, split="train")
+        except Exception:
+            pass
+        return sampler
+
+    # 3) 回退：data/*.txt
+    fallback = list(Path("data").glob("*.txt"))
+    for p in fallback:
+        try:
+            sampler.register(p, split="train")
+        except Exception:
+            continue
+    return sampler
 
 
 def read_last_iteration(path: Path = DAEMON_CSV_PATH) -> int:
@@ -237,6 +265,7 @@ def run_lm(num_lines: int, sampler: DomainSampler | None = None) -> Dict[str, ob
         "delta": delta_ppl,
         "reverted": False,
         "domains_summary": domain_text,
+        "corpus_path": (sampler.last_file() if sampler else None),
         "cause_prob_self": max(0.0, min(1.0, 0.5 + 0.1 * (1.0 / (1.0 + valid_ppl)))),
         "next_plan": f"继续 LM {num_lines} 行，巩固 Δppl {delta_ppl:+.3f}",
         "note": f"lm lines={num_lines}; files={domain_text}",
@@ -300,6 +329,7 @@ def build_report_payload(iteration: int, metrics: Dict[str, object]) -> Dict[str
         "domains_summary": metrics.get("domains_summary"),
         "readability": metrics.get("readability"),
         "text_path": metrics.get("text_path"),
+        "corpus_path": metrics.get("corpus_path") or find_train_corpus_from_config() or "",
     }
 
 
@@ -346,6 +376,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--poll-seconds", type=int, default=30, help="Sleep interval between tasks.")
     parser.add_argument("--rl-episodes", type=int, default=20, help="Episodes per RL call.")
     parser.add_argument("--lm-lines", type=int, default=500, help="Lines per LM update.")
+    parser.add_argument("--corpus-path", type=str, default="", help="Optional explicit corpus text file path.")
     parser.add_argument("--post-len", type=int, default=220, help="Maximum characters per post generation.")
     parser.add_argument(
         "--max-iterations",
@@ -375,7 +406,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     }
     scheduler = Scheduler()
     auto_loop = AutoAdaptLoop()
-    lm_sampler = build_domain_sampler()
+    # 写入语料配置（可选）
+    if args.corpus_path:
+        write_corpus_config_for_path(args.corpus_path)
+    lm_sampler = build_domain_sampler(corpus_path=args.corpus_path or None)
     iteration = read_last_iteration()
     start_iteration = iteration
     try:

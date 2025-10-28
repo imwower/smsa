@@ -61,14 +61,30 @@ python scripts/train_smsa.py --episodes 80 --seed 0
 #       出现 [meta] 自改（如 v_th / eta / inner / patch surrogate 等），Δ < 0 则回滚
 ```
 
-### 4) （可选）字符级外部语料：语言建模（NTP）
+### 4) 外部语料（基于 HF datasets）：语言建模（推荐流程）
+
+1. 安装并展开数据集（默认 suolyer/webqa）
 
 ```bash
-# 准备 UTF-8 文本或 .gz 至 data/ 目录
-python scripts/snn_text_lm.py --corpus_glob "data/*.txt" \
-  --vocab_size 512 --n_in 256 --n_hidden 64 --inner_steps 2
-# 期望：loss / token 与 ppl 稳定下降
+python scripts/fetch_dataset.py --dataset suolyer/webqa --splits train --output data/hf/webqa
 ```
+
+2. 将语料路径写入统一配置并训练（推荐方案 1）
+
+```bash
+# LM（守护进程可读取配置）：
+python scripts/daemon.py --loops lm --poll-seconds 0 --lm-lines 100 \
+  --max-iterations 3 --corpus-path data/hf/webqa/train.txt
+
+# GridWorld / SMSA 训练也可在启动时注入 --corpus-path（自动写入配置）：
+python scripts/train_gridworld.py --episodes 80 --corpus-path data/hf/webqa/train.txt
+python scripts/train_smsa.py --episodes 80 --seed 0 --corpus-path data/hf/webqa/train.txt
+```
+
+3. 统一配置位置
+
+- 路径：`runs/datasets_config.json`
+- 脚本在启动时读取该文件并注册语料（`inputs` 或 `output_dir/train.txt`）
 
 **训练脚本常用参数**
 
@@ -77,7 +93,7 @@ python scripts/snn_text_lm.py --corpus_glob "data/*.txt" \
 - `--eta_e`, `--lam_e`：e-prop 学习率与资格迹衰减。
 - `--inner_steps`：每个观测的内部积分步数（积分更稳）。
 - `--intrinsic_beta`：新奇奖励强度。
-- `--corpus_glob`：语料通配（文本 / `.gz`）。
+- `--corpus-path`：单文件路径；脚本会写入统一配置，训练时按配置加载语料。
 
 ---
 
