@@ -138,15 +138,16 @@ python -m pytest -q
 
 以下命令适合在本地 CPU 上进行“监督 + 持续学习 + 自改 + 自发输出”的联合长跑，所有产物均落地到 `runs/` 目录，便于审计与复盘。
 
-1) 生成可读的随机语料（按主题分布）
+1) 准备语料（使用配置项中的 dataset 语料库）
+
+- 推荐：使用脚本拉取并展开数据集，然后通过 `--corpus-path` 写入统一配置，守护进程会读取该配置。
 
 ```bash
-python - <<'PY'
-from tools.corpus_seed import write_corpus, random_topics
-for i,t in enumerate(random_topics()[:3]):
-    write_corpus(f"data/seed_{i}_{t}.txt", lines=800, topic_hint=t)
-print("seed corpora ready.")
-PY
+# 例：拉取 suolyer/webqa 并展开到 data/hf/webqa
+python scripts/fetch_dataset.py --dataset suolyer/webqa --splits train --output data/hf/webqa
+# 通过启动参数写入 runs/datasets_config.json（之后可不再传 --corpus-path）
+python scripts/daemon.py --loops lm --poll-seconds 0 --lm-lines 50 \
+  --max-iterations 1 --corpus-path data/hf/webqa/train.txt
 ```
 
 2) 启动守护进程（RL + LM + 自改 + 发帖）
