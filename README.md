@@ -177,6 +177,60 @@ python scripts/daemon.py --loops rl,lm,autoadapt,post --poll-seconds 20 \
 
 ---
 
+### 后台运行与有界长跑示例
+
+- 有界长跑（示例 50 轮）：
+
+```bash
+python scripts/daemon.py --loops rl,lm,autoadapt,post \
+  --poll-seconds 10 --rl-episodes 20 --lm-lines 800 --post-len 180 \
+  --max-iterations 50
+```
+
+- 使用 screen（跨平台简单）：
+
+```bash
+screen -S smsa-daemon
+python scripts/daemon.py --loops rl,lm,autoadapt,post --poll-seconds 20 \
+  --rl-episodes 30 --lm-lines 1200 --post-len 200
+# 按下 Ctrl-A 然后 D 以分离；恢复：screen -r smsa-daemon
+```
+
+- 使用 tmux（推荐）：
+
+```bash
+tmux new -s smsa
+python scripts/daemon.py --loops rl,lm,autoadapt,post --poll-seconds 20 \
+  --rl-episodes 30 --lm-lines 1200 --post-len 200
+# 分离：Ctrl-B 然后 D；恢复：tmux attach -t smsa
+```
+
+- 使用 systemd（Linux 用户，用户级服务）
+
+`~/.config/systemd/user/smsa-daemon.service`：
+
+```ini
+[Unit]
+Description=SMSA Background Daemon
+
+[Service]
+WorkingDirectory=%h/code/github/smsa
+ExecStart=/usr/bin/env python scripts/daemon.py --loops rl,lm,autoadapt,post \
+  --poll-seconds 20 --rl-episodes 30 --lm-lines 1200 --post-len 200
+Restart=always
+
+[Install]
+WantedBy=default.target
+```
+
+启用并启动：
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now smsa-daemon
+journalctl --user -u smsa-daemon -f  # 查看日志
+```
+
 ## 路线图（优先级）
 
 - **P0**：GridWorld 环境、策略头、元控制最小闭环、在线 e-prop、基本单测。
