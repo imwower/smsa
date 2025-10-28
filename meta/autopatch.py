@@ -40,10 +40,23 @@ if str(ROOT) not in sys.path:
 SURROGATE_FILE = Path("snn/lif.py")
 DEFAULTS_FILE = Path("snn/dense.py")
 CANDIDATES_FILE = Path("meta/autoadapt.py")
-ANCHORS = {
-    str(SURROGATE_FILE): ("# AUTOPATCH SURROGATE START", "# AUTOPATCH SURROGATE END"),
-    str(DEFAULTS_FILE): ("# AUTOPATCH DEFAULTS START", "# AUTOPATCH DEFAULTS END"),
-    str(CANDIDATES_FILE): ("# AUTOPATCH CANDIDATES START", "# AUTOPATCH CANDIDATES END"),
+DECODE_FILE = Path("scripts/spike_writer.py")
+
+# 多锚点支持：每个文件映射到别名→(start_tag, end_tag)
+ANCHORS: Dict[str, Dict[str, Tuple[str, str]]] = {
+    str(SURROGATE_FILE): {
+        "surrogate": ("# AUTOPATCH SURROGATE START", "# AUTOPATCH SURROGATE END"),
+    },
+    str(DEFAULTS_FILE): {
+        "defaults": ("# AUTOPATCH DEFAULTS START", "# AUTOPATCH DEFAULTS END"),
+    },
+    str(CANDIDATES_FILE): {
+        "candidates": ("# AUTOPATCH CANDIDATES START", "# AUTOPATCH CANDIDATES END"),
+    },
+    str(DECODE_FILE): {
+        "decode_params": ("# AUTOPATCH DECODE PARAMS START", "# AUTOPATCH DECODE PARAMS END"),
+        "decode_logic": ("# AUTOPATCH DECODE LOGIC START", "# AUTOPATCH DECODE LOGIC END"),
+    },
 }
 
 LOG_PATH = Path("runs/autopatch.log")
@@ -63,6 +76,7 @@ class PatchRecipe:
     file: Path
     strategy: str  # "anchor-replace" | "ast-rewrite"
     content: str   # 替换后的锚点内容文本（或函数体/表达式）
+    anchor: str | None = None  # 文件内锚点别名（多锚点文件需指定）
 
 
 # 示例内置补丁（可扩展）：
@@ -115,6 +129,36 @@ _RECIPES: Dict[str, List[PatchRecipe]] = {
                 "DEFAULT_ACTIONS = [\n"
                 "    'eta_up', 'eta_down', 'vth_up', 'vth_down'\n"
                 "]\n"
+            ),
+        )
+    ],
+    # Spike-Writer：解码参数 top-k=80
+    "decode:topk80": [
+        PatchRecipe(
+            file=DECODE_FILE,
+            strategy="anchor-replace",
+            anchor="decode_params",
+            content=(
+                "# 默认解码参数（可由 AutoPatch 在锚点内调整)\n"
+                "DECODE_TOP_K = 80\n\nDECODE_REPEAT_PENALTY = 1.1\n"
+            ),
+        )
+    ],
+    # Spike-Writer：关闭 trigram 阻断
+    "decode:logic_no_trigram": [
+        PatchRecipe(
+            file=DECODE_FILE,
+            strategy="anchor-replace",
+            anchor="decode_logic",
+            content=(
+                "# 可由 AutoPatch 切换 trigram 阻断/采样策略\n"
+                "sample_id = sample_token(\n"
+                "    logits,\n"
+                "    temperature=temperature,\n"
+                "    top_k=DECODE_TOP_K,\n"
+                "    repeat_penalty=DECODE_REPEAT_PENALTY,\n"
+                "    trigram_block=False,\n"
+                ")\n"
             ),
         )
     ],
@@ -229,10 +273,19 @@ def apply_patch(patch_id: str) -> Tuple[List[str], Dict[str, str]]:
 
         before = _read_text(full_path)
         pre_sources[str(path)] = before
-        start_tag, end_tag = ANCHORS.get(str(path), (None, None))
-        if not start_tag or not end_tag:
+        anchor_map = ANCHORS.get(str(path))
+        if not anchor_map:
             _log(f"apply_patch: 未配置锚点: {path}")
             raise ValueError(f"未配置锚点: {path}")
+        if rec.anchor:
+            if rec.anchor not in anchor_map:
+                _log(f"apply_patch: 文件 {path} 缺少锚点 {rec.anchor}")
+                raise ValueError(f"缺少锚点: {rec.anchor}")
+            start_tag, end_tag = anchor_map[rec.anchor]
+        else:
+            if len(anchor_map) != 1:
+                raise ValueError(f"文件 {path} 含多个锚点，需指定 anchor 名称。")
+            start_tag, end_tag = next(iter(anchor_map.values()))
 
         # 备份
         bak_path = _backup_path(timestamp, path)
@@ -322,16 +375,16 @@ def static_checks(changed_files: Sequence[str]) -> bool:
             ok = False
             reasons.append(f"{rel} 顶层函数签名发生变化，禁止。")
 
-        # 数值范围：在锚点中提取浮点数进行约束
-        start_tag, end_tag = ANCHORS.get(rel, (None, None))
-        if start_tag and end_tag:
-            s, e = _find_anchor_span(after, start_tag, end_tag)
-            if s != -1:
+        # 数值范围：在各锚点中提取浮点/整型进行约束
+        anchor_map = ANCHORS.get(rel)
+        if anchor_map:
+            for start_tag, end_tag in anchor_map.values():
+                s, e = _find_anchor_span(after, start_tag, end_tag)
+                if s == -1:
+                    continue
                 block = after[s:e]
-                # 粗略抓取浮点常量
                 import re as _re
-                floats = [float(x) for x in _re.findall(r"(?<![A-Za-z0-9_])([0-9]*\.?[0-9]+)", block)]
-                # 若命名出现则更精确地校验：
+                _ = [float(x) for x in _re.findall(r"(?<![A-Za-z0-9_])([0-9]*\.?[0-9]+)", block)]
                 if "ETA_E_DEFAULT" in block:
                     vals = [float(x) for x in _re.findall(r"ETA_E_DEFAULT\s*=\s*([0-9]*\.?[0-9]+)", block)]
                     for v in vals:
@@ -344,6 +397,18 @@ def static_checks(changed_files: Sequence[str]) -> bool:
                         if not (0.5 <= v <= 0.999):
                             ok = False
                             reasons.append(f"lam_e 超界: {v}")
+                if "DECODE_TOP_K" in block:
+                    vals = [int(x) for x in _re.findall(r"DECODE_TOP_K\s*=\s*([0-9]+)", block)]
+                    for v in vals:
+                        if not (10 <= v <= 200):
+                            ok = False
+                            reasons.append(f"DECODE_TOP_K 超界: {v}")
+                if "DECODE_REPEAT_PENALTY" in block:
+                    vals = [float(x) for x in _re.findall(r"DECODE_REPEAT_PENALTY\s*=\s*([0-9]*\.?[0-9]+)", block)]
+                    for v in vals:
+                        if not (1.0 <= v <= 3.0):
+                            ok = False
+                            reasons.append(f"DECODE_REPEAT_PENALTY 超界: {v}")
 
     if not ok:
         _log("static_checks: 失败 → 执行回滚。原因：" + "; ".join(reasons))
@@ -392,6 +457,15 @@ def smoke_test() -> bool:
         with contextlib.suppress(Exception):
             revert(backups)
         return False
+    # 附加 decode 采样器最小检查
+    try:
+        from scripts import spike_writer as sw  # type: ignore
+        _ = sw.sample_token([0.1, 0.2, 0.3, 0.4], temperature=1.0, top_k=3, repeat_penalty=1.1, trigram_block=True)
+    except Exception as exc:
+        _log(f"smoke_test: decode sampler error: {exc}")
+        with contextlib.suppress(Exception):
+            revert(backups)
+        return False
 
     _log("smoke_test: 通过")
     return True
@@ -411,7 +485,20 @@ def _measure_small_lm(seed: int = 0) -> Tuple[float, float]:
     return score, avg_spikes
 
 
-def ab_evaluate() -> Tuple[float, float]:
+def _measure_post(seed: int = 0) -> Tuple[float, float]:
+    """Measure explainability overall for a short post (higher is better)."""
+    try:
+        from scripts.spike_writer import spike_generate  # type: ignore
+        from tools.explainability import explainability_index
+    except Exception as exc:  # pragma: no cover
+        _log(f"post measure import error: {exc}")
+        return 0.0, 0.0
+    res = spike_generate(max_len=140, seed_text="", topic_hint="autopatch", rng_seed=seed)
+    ei = explainability_index(res.text, "autopatch")
+    return float(ei.get("overall", 0.0) or 0.0), float(res.spike_estimate or 0.0)
+
+
+def ab_evaluate(kind: str = "post") -> Tuple[float, float]:
     """执行 A/B 评估，返回 (delta_score, delta_energy)。
 
     实现：
@@ -431,7 +518,12 @@ def ab_evaluate() -> Tuple[float, float]:
     # 先回滚测 baseline
     with contextlib.suppress(Exception):
         revert(backups)
-    base_score, base_energy = _measure_small_lm(seed=seed)
+    if kind == "lm":
+        base_score, base_energy = _measure_small_lm(seed=seed)
+    elif kind == "post":
+        base_score, base_energy = _measure_post(seed=seed)
+    else:
+        base_score, base_energy = (0.0, 0.0)
 
     # 重新应用补丁（从磁盘状态重建）
     patch_id = ctx.get("patch_id")
@@ -442,7 +534,12 @@ def ab_evaluate() -> Tuple[float, float]:
         _log(f"ab_evaluate: 重新应用补丁失败: {exc}")
         return 0.0, 0.0
 
-    patch_score, patch_energy = _measure_small_lm(seed=seed)
+    if kind == "lm":
+        patch_score, patch_energy = _measure_small_lm(seed=seed)
+    elif kind == "post":
+        patch_score, patch_energy = _measure_post(seed=seed)
+    else:
+        patch_score, patch_energy = (0.0, 0.0)
     delta_score = patch_score - base_score
     delta_energy = patch_energy - base_energy
 
@@ -461,7 +558,7 @@ def ab_evaluate() -> Tuple[float, float]:
 
 
 # 便捷流水线（可选）：一键执行所有步骤。
-def safe_apply_and_eval(patch_id: str) -> Tuple[bool, Tuple[float, float] | None]:
+def safe_apply_and_eval(patch_id: str, *, kind: str = "post") -> Tuple[bool, Tuple[float, float] | None]:
     """封装：apply → static → smoke → A/B。任一步失败自动回滚并返回 False。"""
     try:
         changed, _ = apply_patch(patch_id)
@@ -472,7 +569,7 @@ def safe_apply_and_eval(patch_id: str) -> Tuple[bool, Tuple[float, float] | None
         return False, None
     if not smoke_test():
         return False, None
-    delta = ab_evaluate()
+    delta = ab_evaluate(kind=kind)
     return (delta[0] >= 0.0), delta
 
 
