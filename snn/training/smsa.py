@@ -18,6 +18,11 @@ from snn.lif import LIFParams
 from snn.selfmodel import SelfModel
 from snn.training.gridworld_meta import GridWorldConfig
 from tools.logger import EpisodeMetricsLogger, get_logger
+from tools.reporter import (
+    append_calibration_row,
+    compute_calibration_from_metrics,
+    write_episode_report,
+)
 from tools.replay import ReplayBuffer
 
 
@@ -374,6 +379,9 @@ def train_smsa(
             episode_nll = 0.0
             episode_cause_hits = 0
             episode_energy_mse = 0.0
+            episode_conf_sum = 0.0
+            episode_acc_sum = 0.0
+            episode_selfprob_sum = 0.0
             steps = 0
             reached_goal = 0
             episode_spikes = 0.0
@@ -436,6 +444,12 @@ def train_smsa(
                     1 if self_state.probs_cause[1] >= self_state.probs_cause[0] else 0
                 )
                 cause_hit = 1 if cause_pred == cause_label else 0
+                # 校准对：预测置信与是否命中
+                pred_idx = max(range(len(self_state.probs_next)), key=lambda i: self_state.probs_next[i])
+                acc_hit = 1.0 if pred_idx == next_index else 0.0
+                episode_conf_sum += float(self_state.conf_next_obs)
+                episode_acc_sum += acc_hit
+                episode_selfprob_sum += float(self_state.cause_prob_self)
 
                 episode_nll += nll
                 episode_energy_mse += energy_mse
@@ -453,6 +467,9 @@ def train_smsa(
             avg_nll = episode_nll / float(max(steps, 1))
             avg_energy_mse = episode_energy_mse / float(max(steps, 1))
             cause_acc = episode_cause_hits / float(max(steps, 1))
+            conf_next = episode_conf_sum / float(max(steps, 1))
+            acc_next = episode_acc_sum / float(max(steps, 1))
+            cause_prob_self = episode_selfprob_sum / float(max(steps, 1))
             nll_history.append(avg_nll)
             cause_history.append(cause_acc)
             if running_return is None:
@@ -489,10 +506,38 @@ def train_smsa(
                     "spikes": episode_spikes,
                     "nll": avg_nll,
                     "cause_acc": cause_acc,
+                    "conf_next": conf_next,
+                    "acc_next": acc_next,
+                    "cause_prob_self": cause_prob_self,
                     "meta_action": last_meta["meta_action"],
                     "delta": last_meta["delta"],
                     "reverted": last_meta["reverted"],
                 }
+            )
+
+            # 计算并记录校准指标
+            rho, brier, win = compute_calibration_from_metrics(csv_path, window=50)
+            append_calibration_row(Path(output_dir) / "calibration.csv", episode, rho, brier, win)
+            # 构建一句话描述并写入自报告
+            note = (
+                f"我预测下一观测的置信度 {conf_next:.2f}；过去 {win} 回合的校准相关 ρ={rho:.2f}，"
+                "说明置信度与真实准确度基本一致。"
+            )
+            write_episode_report(
+                Path(output_dir) / "self_report.md",
+                {
+                    "task": "smsa",
+                    "episode": episode,
+                    "avg_return": episode_reward,
+                    "success_rate": success_rate,
+                    "energy": episode_spikes,
+                    "meta_action": last_meta["meta_action"],
+                    "delta": last_meta["delta"],
+                    "reverted": last_meta["reverted"],
+                    "cause_prob_self": cause_prob_self,
+                    "next_plan": "继续探索并校准自我模型",
+                    "calibration_note": note,
+                },
             )
 
         if episode == forget_episode and not forget_triggered:

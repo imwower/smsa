@@ -46,6 +46,9 @@ class SelfModelState:
     hidden_rates: List[float]
     hidden_counts: List[int]
     energy_norm: float
+    # 新增：对下一观测的最大置信与“自因”概率（索引1视为自因）
+    conf_next_obs: float
+    cause_prob_self: float
 
 
 class SelfModel:
@@ -150,6 +153,8 @@ class SelfModel:
         energy_norm = sum(hidden_counts) / float(
             max(1, self.inner_steps * self.hidden.n_out)
         )
+        conf_next = max(probs_next) if probs_next else 0.0
+        prob_self = probs_cause[1] if len(probs_cause) > 1 else 0.0
 
         return SelfModelState(
             probs_next=probs_next,
@@ -159,6 +164,8 @@ class SelfModel:
             hidden_rates=hidden_rates,
             hidden_counts=hidden_counts,
             energy_norm=energy_norm,
+            conf_next_obs=conf_next,
+            cause_prob_self=prob_self,
         )
 
     def _head_gradients(

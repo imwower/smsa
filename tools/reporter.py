@@ -7,6 +7,8 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Sequence
+from tools.logger import CsvLogger
+import statistics
 
 
 def _format_meta(action: str | None, delta: float | None, reverted: bool | None) -> str:
@@ -55,7 +57,12 @@ def write_episode_report(path: str | Path, data: Mapping[str, object]) -> None:
         }
     )
     plan = str(data.get("next_plan", "未指定后续计划"))
-    cause_text = f"Self-Model 预测自因概率 {cause:.2f}" if isinstance(cause, (int, float)) else "Self-Model 自因概率未知"
+    cause_text = (
+        f"Self-Model 预测自因概率 {cause:.2f}"
+        if isinstance(cause, (int, float))
+        else "Self-Model 自因概率未知"
+    )
+    calib_note = str(data.get("calibration_note") or "").strip()
     domain_info = str(data.get("domains_summary") or "").strip()
     delta_ppl = data.get("delta_ppl")
     extra_line = None
@@ -73,6 +80,7 @@ def write_episode_report(path: str | Path, data: Mapping[str, object]) -> None:
         [
             f"- 本次自改：{meta_text}",
             f"- {cause_text}",
+            (f"- {calib_note}" if calib_note else ""),
             f"- 后续计划：{plan}",
             "",
         ]
@@ -80,6 +88,82 @@ def write_episode_report(path: str | Path, data: Mapping[str, object]) -> None:
     content = "\n".join(lines)
     with file_path.open("a", encoding="utf-8") as handle:
         handle.write(content)
+
+
+def _read_conf_acc(path: Path, window: int) -> tuple[list[float], list[float]]:
+    vals_conf: List[float] = []
+    vals_acc: List[float] = []
+    if not path.exists():
+        return vals_conf, vals_acc
+    rows = _read_csv_rows(path)
+    for row in rows[-window:]:
+        try:
+            conf = float(row.get("conf_next") or 0.0)
+            acc = float(row.get("acc_next") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        vals_conf.append(conf)
+        vals_acc.append(acc)
+    return vals_conf, vals_acc
+
+
+def _rankdata(values: Sequence[float]) -> List[float]:
+    if not values:
+        return []
+    sorted_pairs = sorted((v, i) for i, v in enumerate(values))
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(sorted_pairs):
+        j = i
+        total_rank = 0.0
+        while j < len(sorted_pairs) and sorted_pairs[j][0] == sorted_pairs[i][0]:
+            total_rank += j + 1
+            j += 1
+        avg_rank = total_rank / (j - i)
+        for k in range(i, j):
+            ranks[sorted_pairs[k][1]] = avg_rank
+        i = j
+    return ranks
+
+
+def _pearson(x: Sequence[float], y: Sequence[float]) -> float:
+    if len(x) != len(y) or not x:
+        return 0.0
+    mx = sum(x) / len(x)
+    my = sum(y) / len(y)
+    num = sum((a - mx) * (b - my) for a, b in zip(x, y))
+    denx = math.sqrt(sum((a - mx) ** 2 for a in x))
+    deny = math.sqrt(sum((b - my) ** 2 for b in y))
+    if denx == 0.0 or deny == 0.0:
+        return 0.0
+    return num / (denx * deny)
+
+
+def compute_calibration_from_metrics(metrics_csv: str | Path, window: int = 50) -> tuple[float, float, int]:
+    path = Path(metrics_csv)
+    confs, accs = _read_conf_acc(path, window)
+    n = min(len(confs), len(accs))
+    if n == 0:
+        return 0.0, 0.0, 0
+    confs = confs[-n:]
+    accs = accs[-n:]
+    rx = _rankdata(confs)
+    ry = _rankdata(accs)
+    rho = _pearson(rx, ry)
+    brier = sum((c - a) ** 2 for c, a in zip(confs, accs)) / float(n)
+    return rho, brier, n
+
+
+def append_calibration_row(csv_path: str | Path, episode: int, rho: float, brier: float, window: int) -> None:
+    path = Path(csv_path)
+    logger = CsvLogger(path, ["episode", "spearman_rho", "brier", "window"])  # reuse CsvLogger
+    logger.log({
+        "episode": episode,
+        "spearman_rho": f"{rho:.6f}",
+        "brier": f"{brier:.6f}",
+        "window": window,
+    })
+    logger.close()
 
 
 def _read_csv_rows(path: Path) -> List[Dict[str, str]]:
