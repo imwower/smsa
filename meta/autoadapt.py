@@ -294,32 +294,17 @@ class MetaLearner:
             energy_delta: float | None = None
             if action.startswith("code_patch:"):
                 try:
-                    from meta import autopatch as ap
+                    from tools import contracts as qc
                     patch_id = action.split(":", 1)[1]
-                    # 1) 应用补丁（仅锚点内）
-                    ch, baks = ap.apply_patch(patch_id)
-                    changed_files = list(ch)
-                    # 2) 静态检查
-                    if not ap.static_checks(ch):
-                        applied = False
-                        info = "static_checks_failed"
-                        # static_checks 已回滚
+                    decision = qc.enforce_code_patch(patch_id)
+                    applied = decision.accepted
+                    energy_delta = decision.delta_energy
+                    if decision.accepted:
+                        info = (
+                            f"accepted Δ={decision.delta_score:+.3f} net={decision.net_benefit:+.3f}"
+                        )
                     else:
-                        # 3) 冒烟测试
-                        if not ap.smoke_test():
-                            applied = False
-                            info = "smoke_failed"
-                            # smoke_test 已回滚
-                        else:
-                            # 4) A/B 评估
-                            d_score, d_energy = ap.ab_evaluate()
-                            energy_delta = d_energy
-                            if d_score >= 0.0:
-                                applied = True
-                                info = f"patched files={','.join(changed_files)} dE={d_energy:+.2f}"
-                            else:
-                                applied = False
-                                info = f"ab_reverted dE={d_energy:+.2f}"
+                        info = f"veto:{decision.reason}"
                 except Exception as exc:  # 安全兜底
                     applied = False
                     info = f"code_patch_error:{exc}"
