@@ -924,6 +924,9 @@ def train(args: argparse.Namespace) -> None:
     )
 
     dream_helper: Optional[DreamHelper] = None
+    # --dream on/off overrides dream usage (off => no dream augmentation)
+    if getattr(args, "dream", "off") == "off":
+        args.dream_ratio = 0.0
     if args.replay_ratio > 0.0 or args.dream_ratio > 0.0:
         dream_helper = DreamHelper(
             vocab=vocab,
@@ -1067,6 +1070,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--replay-capacity", type=int, default=2048, help="Replay buffer capacity.")
     parser.add_argument("--replay-ratio", type=float, default=0.3, help="Replay sequences per batch ratio.")
     parser.add_argument("--dream-ratio", type=float, default=0.2, help="Dream sequences per batch ratio.")
+    parser.add_argument("--dream", type=str, choices=["on", "off"], default="off", help="Toggle dream augmentation on/off.")
     parser.add_argument("--dream-min-len", type=int, default=3, help="Minimum dream sequence length.")
     parser.add_argument("--dream-max-len", type=int, default=5, help="Maximum dream sequence length.")
     parser.add_argument("--replay-warmup", type=int, default=64, help="Minimum sequences before enabling replay/dream.")

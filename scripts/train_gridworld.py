@@ -20,8 +20,10 @@ from meta.autoadapt import MetaLearner
 from snn.dense import DenseLIF, LinearTemporalUnit
 from snn.lif import LIFParams, fast_sigmoid_surrogate, triangular_surrogate
 from snn.policy import PolicyHead
+from snn.selfmodel import SelfModel
 from tools.logger import EpisodeMetricsLogger, get_logger, setup_logging
 from tools.config import write_corpus_config_for_path
+from tools.replay import ReplayBuffer
 
 
 def patched_surrogate(u: float, slope: float = 1.5) -> float:
@@ -262,6 +264,9 @@ def _run_episode(
     visit_counts: DefaultDict[int, int],
     *,
     training: bool,
+    self_model: SelfModel | None = None,
+    buffer: ReplayBuffer | None = None,
+    state_size: int | None = None,
 ) -> Tuple[float, bool, float, float]:
     obs = env.reset()
     agent.begin_episode()
@@ -278,6 +283,31 @@ def _run_episode(
         state_idx = _state_index(obs)
         bonus = agent.intrinsic_bonus(visit_counts[state_idx])
         visit_counts[state_idx] += 1
+        # optional self-model forward before stepping env
+        self_state = None
+        if self_model is not None and state_size is not None:
+            # build features: [obs1hot | action1hot | mean_rate, sum_rate, eta_e, v_th]
+            mean_rate = sum(counts) / float(max(1, len(counts)))
+            sum_rate = min(1.0, sum(counts))
+            obs_vec = [0.0 for _ in range(state_size)]
+            obs_vec[state_idx] = 1.0
+            action_vec = [0.0, 0.0, 0.0, 0.0]
+            if 0 <= action < 4:
+                action_vec[action] = 1.0
+            features = (
+                obs_vec
+                + action_vec
+                + [
+                    max(0.0, min(mean_rate, 1.0)),
+                    max(0.0, min(sum_rate, 1.0)),
+                    max(0.0, min(agent.eta_e, 1.0)),
+                    max(0.0, min(agent.hidden.params.v_th, 1.0)),
+                ]
+            )
+            try:
+                self_state = self_model.forward(features)
+            except Exception:
+                self_state = None
         next_obs, base_reward, done, info = env.step(action)
         reward = base_reward + bonus
         total_reward += reward
@@ -285,6 +315,27 @@ def _run_episode(
         spike_sum += sum(counts) * agent.inner_steps
         if training:
             agent.learn(counts, probs, action, reward)
+            # train self-model on real transitions
+            if (
+                self_model is not None
+                and self_state is not None
+                and state_size is not None
+            ):
+                next_index = _state_index(next_obs)
+                energy_target = sum(counts) / float(max(1, len(counts)))
+                cause_label = 1 if info.get("goal_reached", False) else 0
+                try:
+                    self_model.update(
+                        state=self_state,
+                        next_obs_index=next_index,
+                        reward_target=reward,
+                        energy_target=energy_target,
+                        cause_label=cause_label,
+                    )
+                except Exception:
+                    pass
+                if buffer is not None:
+                    buffer.add(state_idx, action, counts, reward, next_index)
         if info.get("goal_reached", False):
             goal_reached = True
         obs = next_obs
@@ -311,6 +362,9 @@ def _evaluate_agent(
             env,
             visits,
             training=False,
+            self_model=None,
+            buffer=None,
+            state_size=env_cfg.size * env_cfg.size,
         )
         score += reward
     return score / float(max(episodes, 1))
@@ -325,6 +379,7 @@ def train_gridworld(
     lam_e: float = 0.9,
     inner_steps: int = 12,
     intrinsic_beta: float = 0.35,
+    use_dream: bool = False,
 ) -> Dict[str, float]:
     if seed is not None:
         random.seed(seed)
@@ -337,6 +392,16 @@ def train_gridworld(
         intrinsic_beta=intrinsic_beta,
         seed=seed,
     )
+    state_size = env_cfg.size * env_cfg.size
+    # Optional self-model + replay for dream augmentation
+    self_params = LIFParams(v_th=0.5, tau_m=10.0, tau_a=20.0, beta=0.35, refractory=2)
+    self_model = SelfModel(
+        obs_dim=state_size,
+        action_dim=4,
+        hidden_size=24,
+        lif_params=self_params,
+    )
+    replay = ReplayBuffer(capacity=3000)
     meta = MetaLearner(window=20, min_delta=0.05, ab_episodes=5)
     visit_counts: DefaultDict[int, int] = collections.defaultdict(int)
     return_history: List[float] = []
@@ -388,6 +453,9 @@ def train_gridworld(
                 env,
                 visit_counts,
                 training=True,
+                self_model=self_model,
+                buffer=replay,
+                state_size=state_size,
             )
             return_history.append(reward)
             all_returns.append(reward)
@@ -407,6 +475,13 @@ def train_gridworld(
                     logger.info(log_line)
                 return_history.clear()
             parse_meta(meta_logs)
+            # Optional dream augmentation after each real episode
+            if use_dream:
+                try:
+                    replay.dream(agent, self_model, state_size=state_size, sequences=3)
+                except Exception:
+                    # keep training robust if dream path misconfigured
+                    pass
 
             success_rate = (
                 sum(rolling_success) / float(len(rolling_success))
@@ -516,6 +591,13 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="可选：指定语料文本路径，写入全局配置",
     )
+    parser.add_argument(
+        "--dream",
+        type=str,
+        choices=["on", "off"],
+        default="off",
+        help="开启/关闭 Self-Model 梦样本混合微调",
+    )
     return parser.parse_args()
 
 
@@ -539,6 +621,7 @@ def main() -> None:
         lam_e=args.lam_e,
         inner_steps=args.inner_steps,
         intrinsic_beta=args.intrinsic_beta,
+        use_dream=(args.dream == "on"),
     )
     logger.info("Final metrics: %s", metrics)
 

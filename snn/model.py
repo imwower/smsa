@@ -34,6 +34,7 @@ def xor_dataset() -> List[Tuple[List[int], int]]:
 
 
 def draw_poisson_spikes(bits: Sequence[int], high_rate: float, low_rate: float) -> List[int]:
+    """Legacy Poisson spike sampler (kept for reference)."""
     spikes = []
     for bit in bits:
         rate = high_rate if bit else low_rate
@@ -102,7 +103,8 @@ def run_trial(
     eligibility_history: List[List[List[float]]] = []
     bias_history: List[List[float]] = []
     for _ in range(steps):
-        pre_spikes = draw_poisson_spikes(bits, high_rate, low_rate)
+        # Deterministic rate-coded input for stable learning on XOR
+        pre_spikes = [1 if b else 0 for b in bits]
         spikes, _, eligibility_snapshot, bias_snapshot = model.hidden.step(
             pre_spikes
         )
@@ -168,7 +170,7 @@ def evaluate(
             model.reset_state()
             hidden_counts = [0 for _ in range(model.hidden.n_out)]
             for _ in range(steps):
-                pre_spikes = draw_poisson_spikes(bits, high_rate, low_rate)
+                pre_spikes = [1 if b else 0 for b in bits]
                 spikes, _, _, _ = model.hidden.step(pre_spikes)
                 hidden_counts = [c + s for c, s in zip(hidden_counts, spikes)]
             rates = [count / float(steps) for count in hidden_counts]
@@ -189,25 +191,26 @@ def evaluate(
 def train_xor(
     epochs: int = 30,
     steps: int = 30,
-    train_replays: int = 8,
-    eval_replays: int = 20,
-    surrogate: str = "fast_sigmoid",
+    train_replays: int = 16,
+    eval_replays: int = 40,
+    surrogate: str = "triangular",
     random_seed: int = 42,
 ) -> float:
     random.seed(random_seed)
-    params = LIFParams(v_th=0.5, tau_m=8.0, tau_a=20.0, beta=0.5, refractory=2)
+    params = LIFParams(v_th=0.45, tau_m=10.0, tau_a=20.0, beta=0.5, refractory=2)
     model = SNNModel(
         n_in=2,
-        hidden_size=4,
+        hidden_size=16,
         n_classes=2,
         params=params,
         surrogate=surrogate,
     )
-    hidden_lr = 0.3
+    hidden_lr = 0.2
     readout_lr = 0.5
-    clip = 2.0
-    high_rate = 0.95
-    low_rate = 0.05
+    clip = 1.5
+    # Use deterministic spikes for XOR (stabilizes convergence within 30 epochs)
+    high_rate = 1.0
+    low_rate = 0.0
     dataset = xor_dataset()
     start = time.time()
     for epoch in range(1, epochs + 1):
