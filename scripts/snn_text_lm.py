@@ -53,15 +53,16 @@ LM_FIELDS = [
     "train_ppl",
     "valid_ppl",
     "delta_ppl",
+    "spikes",
     "files",
     "topics",
 ]
 
 
-def _ensure_lm_csv() -> None:
-    LM_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if not LM_CSV_PATH.exists():
-        with LM_CSV_PATH.open("w", newline="", encoding="utf-8") as handle:
+def _ensure_lm_csv(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=LM_FIELDS)
             writer.writeheader()
 
@@ -103,10 +104,11 @@ def _append_lm_row(
     train_ppl: float,
     valid_ppl: float,
     delta_ppl: float,
+    avg_spikes: float,
     files: Mapping[str, int],
     topics: Mapping[str, int],
 ) -> None:
-    _ensure_lm_csv()
+    _ensure_lm_csv(LM_CSV_PATH)
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     row = {
         "timestamp": timestamp,
@@ -115,6 +117,7 @@ def _append_lm_row(
         "train_ppl": f"{train_ppl:.6f}",
         "valid_ppl": f"{valid_ppl:.6f}",
         "delta_ppl": f"{delta_ppl:.6f}",
+        "spikes": f"{avg_spikes:.6f}",
         "files": _format_counts(files, short=True),
         "topics": _format_counts(topics, short=True),
     }
@@ -1076,8 +1079,12 @@ def train_lines(
     *,
     sampler: "DomainSampler | None" = None,
     valid_interval: int = 200,
+    log_path: str | Path | None = None,
 ) -> Dict[str, object]:
     """Lightweight LM training used by daemon loops."""
+    global LM_CSV_PATH
+    if log_path is not None:
+        LM_CSV_PATH = Path(log_path)
     rng = random.Random(seed)
     target_lines = max(1, num_lines)
     collected: List[List[str]] = []
@@ -1095,7 +1102,11 @@ def train_lines(
             topic_counts["synthetic"] = topic_counts.get("synthetic", 0) + 1
             continue
         try:
-            batch_lines = list(sampler.next_batch(chunk))
+            # 兼容新版 DomainSampler.next_lines()
+            if hasattr(sampler, "next_lines"):
+                batch_lines = list(sampler.next_lines(chunk))  # type: ignore[attr-defined]
+            else:
+                batch_lines = list(sampler.next_batch(chunk))
         except RuntimeError:
             sampler = None
             continue
@@ -1168,6 +1179,7 @@ def train_lines(
             last_valid = _evaluate_ppl(model, vocab, valid_sequences)
             avg_loss = total_loss / float(max(1, total_tokens))
             train_ppl = math.exp(min(20.0, avg_loss))
+            avg_spikes_mid = total_spikes / float(max(1, total_tokens))
             delta = (
                 (prev_logged_ppl - last_valid)
                 if (prev_logged_ppl is not None and math.isfinite(last_valid))
@@ -1179,6 +1191,7 @@ def train_lines(
                 train_ppl=train_ppl,
                 valid_ppl=last_valid,
                 delta_ppl=delta,
+                avg_spikes=avg_spikes_mid,
                 files=file_counts,
                 topics=topic_counts,
             )
@@ -1190,6 +1203,7 @@ def train_lines(
         last_valid = _evaluate_ppl(model, vocab, valid_sequences)
         avg_loss = total_loss / float(max(1, total_tokens))
         train_ppl = math.exp(min(20.0, avg_loss))
+        avg_spikes_mid = total_spikes / float(max(1, total_tokens))
         delta = (
             (prev_logged_ppl - last_valid)
             if (prev_logged_ppl is not None and math.isfinite(last_valid))
@@ -1201,6 +1215,7 @@ def train_lines(
             train_ppl=train_ppl,
             valid_ppl=last_valid,
             delta_ppl=delta,
+            avg_spikes=avg_spikes_mid,
             files=file_counts,
             topics=topic_counts,
         )
