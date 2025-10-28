@@ -27,6 +27,7 @@ from scripts.snn_text_lm import (  # type: ignore
     tokenize,
 )
 from tools.readability import grade
+from tools.explainability import explainability_index
 
 
 DEFAULT_CORPUS_GLOBS = ["data/seed_*.txt"]
@@ -36,6 +37,88 @@ WARMUP_EPOCHS = 1
 WARMUP_SEQS_PER_EPOCH = 0
 WARMUP_TOKEN_LIMIT = 0
 BIGRAM_BLEND = 0.92
+
+# AUTOPATCH DECODE PARAMS START
+# 默认解码参数（可由 AutoPatch 在锚点内调整）
+DECODE_TOP_K = 50
+DECODE_REPEAT_PENALTY = 1.1
+# AUTOPATCH DECODE PARAMS END
+
+# 运行时解码上下文（用于重复惩罚与 trigram 阻断）
+_DECODE_HISTORY_IDS: list[int] = []
+_DECODE_TRIGRAMS: set[tuple[int, int, int]] = set()
+
+def _softmax(logits: Sequence[float]) -> List[float]:
+    if not logits:
+        return []
+    apex = max(logits)
+    exps = [math.exp(val - apex) for val in logits]
+    denom = sum(exps)
+    if denom <= 0.0:
+        return [1.0 / len(logits) for _ in logits]
+    return [v / denom for v in exps]
+
+
+def sample_token(
+    logits: Sequence[float],
+    *,
+    temperature: float = 1.0,
+    top_k: int = DECODE_TOP_K,
+    repeat_penalty: float = DECODE_REPEAT_PENALTY,
+    trigram_block: bool = True,
+) -> int:
+    """标准库实现的采样器（top‑k / 温度 / 重复惩罚 / trigram 阻断）。
+
+    说明：
+    - logits 可为任意实数分数（相对大小决定选择概率）
+    - 温度通过对 logits 除以 temperature 实现；temperature→0 趋于贪心
+    - top_k 仅保留最高 K 个分数；其余设为 -inf
+    - 重复惩罚：若 token 历史频次为 c，则分数 / (repeat_penalty ** c)
+    - trigram 阻断：若最近两 token 与候选构成的三元组出现过，则屏蔽
+    """
+    global _DECODE_HISTORY_IDS, _DECODE_TRIGRAMS
+    if temperature <= 0.0:
+        raise ValueError("temperature 必须为正数")
+
+    scores = list(logits)
+    # 温度缩放
+    if not math.isclose(temperature, 1.0, abs_tol=1e-6):
+        inv = 1.0 / temperature
+        scores = [val * inv for val in scores]
+
+    # top-k 过滤
+    k = max(1, min(int(top_k), len(scores)))
+    top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
+    mask = [False] * len(scores)
+    for i in top_idx:
+        mask[i] = True
+    min_val = min(scores) - 1e6
+    scores = [scores[i] if mask[i] else min_val for i in range(len(scores))]
+
+    # 重复惩罚
+    if repeat_penalty > 1.0 and _DECODE_HISTORY_IDS:
+        freq = Counter(_DECODE_HISTORY_IDS)
+        for i in range(len(scores)):
+            c = freq.get(i, 0)
+            if c > 0:
+                scores[i] = scores[i] / (repeat_penalty ** c)
+
+    # trigram 阻断（仅当历史长度 ≥2）
+    if trigram_block and len(_DECODE_HISTORY_IDS) >= 2 and _DECODE_TRIGRAMS:
+        a, b = _DECODE_HISTORY_IDS[-2], _DECODE_HISTORY_IDS[-1]
+        for i in range(len(scores)):
+            if (a, b, i) in _DECODE_TRIGRAMS:
+                scores[i] = min_val
+
+    # 采样
+    probs = _softmax(scores)
+    r = random.random()
+    acc = 0.0
+    for i, p in enumerate(probs):
+        acc += p
+        if r <= acc:
+            return i
+    return len(probs) - 1
 
 
 @dataclass
@@ -195,49 +278,64 @@ def spike_generate(
     for _ in range(max_len):
         state = model.forward(prev_token)
         spike_accum += sum(state.hidden_rates) * model.inner_steps
-        probs = list(_temperature_adjust(state.probs, temperature))
-        # 避免采样特殊符号
+        # 计算 logits（基于隐藏率和读出头），便于进行 top-k / 温度 / 惩罚
+        logits = []
+        for vidx in range(len(model.readout_bias)):
+            val = model.readout_bias[vidx]
+            for h in range(model.hidden.n_out):
+                val += model.readout_weights[h][vidx] * state.hidden_rates[h]
+            logits.append(val)
+
+        # 避免特殊 token（BOS/UNK 提前抑制；在短序列阶段禁用 EOS）
         bos_id = vocab.encode(TOKEN_BOS)
         unk_id = vocab.unk_id
-        if 0 <= bos_id < len(probs):
-            probs[bos_id] = 0.0
-        if 0 <= unk_id < len(probs):
-            probs[unk_id] = probs[unk_id] * 0.3
         eos_id = vocab.encode(TOKEN_EOS)
-        if len(generated) < min_generated and 0 <= eos_id < len(probs):
-            probs[eos_id] = 0.0
+        if 0 <= bos_id < len(logits):
+            logits[bos_id] = -1e9
+        if 0 <= unk_id < len(logits):
+            logits[unk_id] -= 2.0
+        if len(generated) < min_generated and 0 <= eos_id < len(logits):
+            logits[eos_id] = -1e9
+
+        # Bigram 融合：作为先验加成（转为 logits 空间近似相加）
         if context_model.transitions:
             counts = context_model.transitions.get(prev_token)
-            blended = [p * (1.0 - BIGRAM_BLEND) for p in probs]
             if counts:
                 total_counts = context_model.totals.get(prev_token, 0)
                 if total_counts > 0:
-                    for token, cnt in counts.items():
-                        idx = vocab.token_to_id.get(token)
-                        if idx is None or idx < 0 or idx >= len(blended):
+                    for tok, cnt in counts.items():
+                        idx = vocab.token_to_id.get(tok)
+                        if idx is None or idx < 0 or idx >= len(logits):
                             continue
-                        blended[idx] += BIGRAM_BLEND * (cnt / total_counts)
+                        logits[idx] += math.log(1e-8 + BIGRAM_BLEND * (cnt / total_counts))
             else:
-                for token, prob in context_model.fallback_probs.items():
-                    idx = vocab.token_to_id.get(token)
-                    if idx is None or idx < 0 or idx >= len(blended):
+                for tok, prob in context_model.fallback_probs.items():
+                    idx = vocab.token_to_id.get(tok)
+                    if idx is None or idx < 0 or idx >= len(logits):
                         continue
-                    blended[idx] += BIGRAM_BLEND * prob
-            probs = blended
-        if len(generated) < min_generated and 0 <= eos_id < len(probs):
-            probs[eos_id] = 0.0
+                    logits[idx] += math.log(1e-8 + BIGRAM_BLEND * prob)
 
-        total = sum(probs)
-        if total <= 0.0:
-            probs = [1.0 / len(probs) for _ in probs]
-        else:
-            probs = [p / total for p in probs]
-        sample_id = _sample_from_probs(probs, rng)
+        # AUTOPATCH DECODE LOGIC START
+        # 可由 AutoPatch 切换 trigram 阻断/采样策略
+        sample_id = sample_token(
+            logits,
+            temperature=temperature,
+            top_k=DECODE_TOP_K,
+            repeat_penalty=DECODE_REPEAT_PENALTY,
+            trigram_block=True,
+        )
+        # AUTOPATCH DECODE LOGIC END
+
         token = vocab.id_to_token[sample_id]
         if token in stop_tokens:
             break
         generated.append(token)
         prev_token = token
+        # 更新解码上下文（历史与 trigram 集）
+        _DECODE_HISTORY_IDS.append(sample_id)
+        if len(_DECODE_HISTORY_IDS) >= 3:
+            tri = tuple(_DECODE_HISTORY_IDS[-3:])
+            _DECODE_TRIGRAMS.add(tri)  # type: ignore[arg-type]
 
     topic_prefix = ""
     if topic_hint:
@@ -245,15 +343,16 @@ def spike_generate(
     generated_text = "".join(generated)
     base_text = _postprocess_text(f"{seed_text}{generated_text}")
     full_text = f"{topic_prefix}{base_text}" if topic_prefix else base_text
-    evaluation = grade(full_text, topic_hint=topic_hint)
+    # Explainability 评分（替代原 readability.grade）
+    ei = explainability_index(full_text, topic_hint)
 
     return GenerationResult(
         text=full_text,
         tokens_generated=len(generated),
         spike_estimate=spike_accum,
-        readability=evaluation["readability"],
-        context=evaluation["context"],
-        notes=evaluation["notes"],
+        readability=float(ei.get("readability", 0.0)),
+        context=float(ei.get("context", 0.0)),
+        notes=list(ei.get("notes", [])),
     )
 
 
@@ -262,7 +361,9 @@ def _write_feed(result: GenerationResult, topic_hint: str | None, max_len: int, 
     runs_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
     path = runs_dir / f"{timestamp}.md"
-    notes_text = "\n".join(f"- {note}" for note in result.notes)
+    # Explainability 额外字段
+    ei = explainability_index(result.text, topic_hint)
+    notes_text = "\n".join(f"- {note}" for note in (ei.get("notes") or []))
     metadata = (
         f"# Spike Writer Output\n"
         f"- Timestamp: {timestamp}\n"
@@ -271,11 +372,18 @@ def _write_feed(result: GenerationResult, topic_hint: str | None, max_len: int, 
         f"- Temperature: {temperature:.2f}\n"
         f"- Generated Tokens: {result.tokens_generated}\n"
         f"- Spike Estimate: {result.spike_estimate:.2f}\n"
-        f"- Readability: {result.readability:.4f}\n"
-        f"- Context Alignment: {result.context:.4f}\n"
+        f"- Readability: {ei.get('readability', 0.0):.4f}\n"
+        f"- Context Alignment: {ei.get('context', 0.0):.4f}\n"
+        f"- Self-Explain: {ei.get('self_explain', 0.0):.4f}\n"
+        f"- Overall Index: {ei.get('overall', 0.0):.4f}\n"
         f"- Notes:\n{notes_text}\n\n"
         f"## Content\n"
-        f"{result.text}\n"
+        f"{result.text}\n\n"
+        f"## Explainability\n"
+        f"readability={ei.get('readability', 0.0):.4f} "
+        f"context={ei.get('context', 0.0):.4f} "
+        f"self_explain={ei.get('self_explain', 0.0):.4f} "
+        f"overall={ei.get('overall', 0.0):.4f}\n"
     )
     with path.open("w", encoding="utf-8") as handle:
         handle.write(metadata)
