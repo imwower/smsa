@@ -16,7 +16,8 @@ if str(ROOT) not in sys.path:
 
 from meta.autoadapt import MetaLearner
 from scripts.snn_text_lm import train_lines
-from scripts.spike_writer import _write_feed, spike_generate
+from scripts.spike_writer import _write_feed, spike_generate, GenerationResult
+from tools.supervisor import SupervisedPost
 from scripts.train_gridworld import train_once
 from tools.corpus import DomainSampler
 from tools.config import write_corpus_config_for_path, find_train_corpus_from_config
@@ -45,6 +46,7 @@ LM_STATE_PATH = Path("runs/corpus_state.json")
 ENERGY_COEFF_RL = 0.001
 ENERGY_COEFF_LM = 0.0005
 ENERGY_COEFF_POST = 0.0002
+POST_FAIL_MAX = 3  # 连续不达标次数阈值（默认 3）
 
 _RL_HISTORY: Dict[str, float | None] = {"avg_return": None}
 
@@ -284,30 +286,62 @@ def run_autoadapt(loop: AutoAdaptLoop) -> Dict[str, object]:
     return payload
 
 
-def run_post(length: int, *, topic_hint: str | None = None, temperature: float = 1.0) -> Dict[str, object]:
-    result = spike_generate(
-        max_len=length,
-        seed_text="",
-        temperature=temperature,
-        topic_hint=topic_hint,
+def run_post(
+    length: int,
+    *,
+    topic_hint: str | None = None,
+    temperature: float = 1.0,
+    attempts: int = 3,
+    post_thresholds: Dict[str, float] | None = None,
+) -> Dict[str, object]:
+    """调用 SupervisedPost 进行解释性门控与自适应重试。"""
+    thresholds = post_thresholds or {"overall": 0.62, "self_explain": 0.40}
+    sp = SupervisedPost(attempts=attempts, thresholds=thresholds)
+    res = sp.run(topic=topic_hint, max_len=length)
+    text = str(res.get("text", ""))
+    score = float(res.get("score", 0.0) or 0.0)
+    details = res.get("details", {}) if isinstance(res.get("details"), dict) else {}
+    read = float(details.get("readability", 0.0) or 0.0)
+    ctx = float(details.get("context", 0.0) or 0.0)
+    # 落地到 feed：复用 _write_feed（构造最小 GenerationResult）
+    gen = GenerationResult(
+        text=text,
+        tokens_generated=len(text),
+        spike_estimate=0.0,
+        readability=read,
+        context=ctx,
+        notes=list(details.get("notes", [])) if isinstance(details.get("notes"), list) else [],
     )
-    text_path = _write_feed(result, topic_hint, length, temperature)
-    reward = result.readability
-    energy_penalty = result.spike_estimate * ENERGY_COEFF_POST
+    text_path = _write_feed(gen, topic_hint, length, temperature)
+    trained = any("ntp:" in a for a in res.get("actions", []))
+    patched = any("autopatch" in a for a in res.get("actions", []))
+    attempts_used = int(res.get("attempts", 1) or 1)
+    best_act = str(res.get("best_action") or "baseline")
+    note = f"post attempts={attempts_used} best={best_act} trained={trained} patched={patched} feed={Path(text_path).name}"
     return {
         "task": "post",
-        "reward": reward,
-        "energy_penalty": energy_penalty,
-        "readability": result.readability,
-        "context": result.context,
-        "spikes": result.spike_estimate,
+        "reward": score,
+        "energy_penalty": 0.0,
+        "readability": read,
+        "context": ctx,
+        "spikes": 0.0,
         "text_path": str(text_path),
-        "meta_action": None,
-        "delta": result.readability,
+        "meta_action": best_act if best_act != "baseline" else None,
+        "delta": score,
         "reverted": False,
-        "cause_prob_self": max(0.1, min(0.9, result.readability)),
-        "next_plan": "根据评分挑选优秀内容发布，并准备下一次主题草稿。",
-        "note": f"post feed={text_path.name}",
+        "cause_prob_self": max(0.1, min(0.95, score)),
+        "next_plan": (
+            "若分数不足，将继续解码器微调与小步训练"
+            if score < thresholds.get("overall", 0.62)
+            else "得分良好，准备下一轮主题草稿"
+        ),
+        "note": note,
+        "post_attempts": attempts_used,
+        "post_best_action": best_act,
+        "post_trained": trained,
+        "post_patched": patched,
+        "post_threshold_overall": thresholds.get("overall", 0.62),
+        "post_threshold_self": thresholds.get("self_explain", 0.40),
     }
 
 
@@ -378,6 +412,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lm-lines", type=int, default=500, help="Lines per LM update.")
     parser.add_argument("--corpus-path", type=str, default="", help="Optional explicit corpus text file path.")
     parser.add_argument("--post-len", type=int, default=220, help="Maximum characters per post generation.")
+    parser.add_argument("--post-fail-max", type=int, default=POST_FAIL_MAX, help="Max consecutive under-threshold posts before forced lm+autoadapt.")
+    parser.add_argument("--post-threshold", type=float, default=0.62, help="Overall score threshold for supervised post.")
+    parser.add_argument("--post-min-self", type=float, default=0.40, help="Self-explain score threshold for supervised post.")
     parser.add_argument(
         "--max-iterations",
         type=int,
@@ -411,6 +448,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         write_corpus_config_for_path(args.corpus_path)
     lm_sampler = build_domain_sampler(corpus_path=args.corpus_path or None)
     iteration = read_last_iteration()
+    post_fail_streak = 0
     start_iteration = iteration
     try:
         while True:
@@ -428,7 +466,25 @@ def main(argv: Sequence[str] | None = None) -> None:
                 metrics = run_lm(num_lines, sampler=lm_sampler)
             elif task == "post":
                 length = int(getattr(selection, "budget", args.post_len))
-                metrics = run_post(length)
+                metrics = run_post(
+                    length,
+                    topic_hint=None,
+                    temperature=1.0,
+                    attempts=3,
+                    post_thresholds={
+                        "overall": float(args.post_threshold),
+                        "self_explain": float(args.post_min_self),
+                    },
+                )
+                # 解释性门控：连续不达标则强制调度一次 lm 与 autoadapt
+                passed = (
+                    float(metrics.get("reward", 0.0)) >= float(args.post_threshold)
+                    and float(metrics.get("cause_prob_self", 0.0)) >= float(args.post_min_self)
+                )
+                if not passed:
+                    post_fail_streak += 1
+                else:
+                    post_fail_streak = 0
             else:
                 metrics = run_autoadapt(auto_loop)
             scheduler.update(
@@ -439,8 +495,40 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
             iteration += 1
             metrics["task"] = task
+            # 追加 post 解释性摘要到 self_report
+            payload = build_report_payload(iteration, metrics)
+            if task == "post":
+                attempts_used = metrics.get("post_attempts", 1)
+                best_act = metrics.get("post_best_action", "baseline")
+                trained = metrics.get("post_trained", False)
+                patched = metrics.get("post_patched", False)
+                payload["calibration_note"] = (
+                    f"解释性尝试 {attempts_used} 次；最佳动作 {best_act}；"
+                    f"触发训练 {bool(trained)}；触发补丁 {bool(patched)}。"
+                )
             log_daemon_metrics(iteration, metrics)
-            write_episode_report("runs/self_report.md", build_report_payload(iteration, metrics))
+            write_episode_report("runs/self_report.md", payload)
+
+            # 若 post 连续不达标，强制追加一次 lm 与一次 autoadapt
+            if task == "post" and post_fail_streak >= int(args.post_fail_max):
+                # LM
+                num_lines = max(1000, int(args.lm_lines))
+                lm_metrics = run_lm(num_lines, sampler=lm_sampler)
+                scheduler.update("lm", lm_metrics["reward"], energy_penalty=lm_metrics.get("energy_penalty", 0.0), note=lm_metrics.get("note", ""))
+                iteration += 1
+                lm_metrics["task"] = "lm"
+                log_daemon_metrics(iteration, lm_metrics)
+                write_episode_report("runs/self_report.md", build_report_payload(iteration, lm_metrics))
+
+                # AutoAdapt
+                auto_metrics = run_autoadapt(auto_loop)
+                scheduler.update("autoadapt", auto_metrics["reward"], energy_penalty=auto_metrics.get("energy_penalty", 0.0), note=auto_metrics.get("note", ""))
+                iteration += 1
+                auto_metrics["task"] = "autoadapt"
+                log_daemon_metrics(iteration, auto_metrics)
+                write_episode_report("runs/self_report.md", build_report_payload(iteration, auto_metrics))
+                # 重置 streak
+                post_fail_streak = 0
             time.sleep(max(0, args.poll_seconds))
     except KeyboardInterrupt:
         print("Daemon stopped by user.")
