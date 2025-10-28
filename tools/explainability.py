@@ -311,10 +311,17 @@ def suggest_actions(ei: Mapping[str, object]) -> List[Dict[str, object]]:
         add("rollback", "若多轮无改善，回滚前次改动", {}, 6)
 
     # 去重并按优先级排序
+    def _hashable(x):
+        if isinstance(x, dict):
+            return tuple((k, _hashable(v)) for k, v in sorted(x.items()))
+        if isinstance(x, list):
+            return tuple(_hashable(v) for v in x)
+        return x
+
     seen = set()
     uniq: List[Dict[str, object]] = []
     for act in sorted(actions, key=lambda x: x.get("priority", 5)):
-        key = (act["action"], tuple(sorted(act.get("params", {}).items())))
+        key = (act["action"], _hashable(act.get("params", {})))
         if key in seen:
             continue
         seen.add(key)
@@ -343,4 +350,3 @@ if __name__ == "__main__":
     print("bad:", ei_bad)
     print("good:", ei_good)
     print("suggest:", suggest_actions(ei_bad))
-
