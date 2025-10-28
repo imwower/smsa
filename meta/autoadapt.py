@@ -109,15 +109,26 @@ class AdaptationLog:
     def format(self) -> str:
         status = "reverted" if self.reverted else "accepted"
         suffix = f" info={self.info}" if self.info else ""
-        return (
+        base = (
             f"[meta] ep{self.step:03d} action={self.action} "
             f"delta={self.delta:.3f} ({status}, pos={self.positive_ratio:.2f}){suffix}"
         )
+        # 针对代码补丁动作，生成一句中文解释，便于写入报告/日志
+        if isinstance(self.action, str) and self.action.startswith("code_patch:"):
+            kind = self.action.split(":", 1)[1]
+            if kind.startswith("surrogate"):
+                desc = "我尝试了将替代导数切换为矩形窗以增强梯度的稀疏性"
+            else:
+                desc = "我尝试了基于代码的安全补丁以优化模型行为"
+            verdict = "已保留" if not self.reverted else "已回滚"
+            base += f" | {desc}，A/B 提升 {self.delta:+.2f}，{verdict}"
+        return base
 
 
 class MetaLearner:
     """使用 UCB 选择自改动作，并通过 A/B 测试验证。"""
 
+    # AUTOPATCH CANDIDATES START
     DEFAULT_ACTIONS = [
         "eta_up",
         "eta_down",
@@ -127,11 +138,16 @@ class MetaLearner:
         "intrinsic_down",
         "inner_up",
         "inner_down",
+        # 结构性动作示例
         "add_neuron",
         "prune_neuron",
         "switch_surrogate",
         "patch_surrogate",
+        # 代码级补丁动作（由 meta.autopatch 执行）
+        # 可使用别名：code_patch:surrogate_rect / code_patch:defaults_eta_up 等
+        "code_patch:surrogate_rect",
     ]
+    # AUTOPATCH CANDIDATES END
 
     def __init__(
         self,
@@ -176,6 +192,9 @@ class MetaLearner:
         self.fallback_action = fallback_action
         if self.fallback_action and self.fallback_action not in action_list:
             action_list.append(self.fallback_action)
+        # 始终注入代码补丁候选（即便外部显式传入 actions）
+        if "code_patch:surrogate_rect" not in action_list:
+            action_list.append("code_patch:surrogate_rect")
         self.actions = action_list
         if not self.actions:
             raise ValueError("必须提供至少一个自改动作。")
@@ -270,10 +289,45 @@ class MetaLearner:
             trial_agent = copy.deepcopy(agent)
             applied = False
             info: str | None = None
-            if hasattr(trial_agent, "apply_modification"):
-                applied, info = trial_agent.apply_modification(action)
+            # 新增：代码补丁动作
+            changed_files: list[str] | None = None
+            energy_delta: float | None = None
+            if action.startswith("code_patch:"):
+                try:
+                    from meta import autopatch as ap
+                    patch_id = action.split(":", 1)[1]
+                    # 1) 应用补丁（仅锚点内）
+                    ch, baks = ap.apply_patch(patch_id)
+                    changed_files = list(ch)
+                    # 2) 静态检查
+                    if not ap.static_checks(ch):
+                        applied = False
+                        info = "static_checks_failed"
+                        # static_checks 已回滚
+                    else:
+                        # 3) 冒烟测试
+                        if not ap.smoke_test():
+                            applied = False
+                            info = "smoke_failed"
+                            # smoke_test 已回滚
+                        else:
+                            # 4) A/B 评估
+                            d_score, d_energy = ap.ab_evaluate()
+                            energy_delta = d_energy
+                            if d_score >= 0.0:
+                                applied = True
+                                info = f"patched files={','.join(changed_files)} dE={d_energy:+.2f}"
+                            else:
+                                applied = False
+                                info = f"ab_reverted dE={d_energy:+.2f}"
+                except Exception as exc:  # 安全兜底
+                    applied = False
+                    info = f"code_patch_error:{exc}"
             else:
-                info = "missing apply_modification"
+                if hasattr(trial_agent, "apply_modification"):
+                    applied, info = trial_agent.apply_modification(action)
+                else:
+                    info = "missing apply_modification"
 
             delta = 0.0
             reverted = True
