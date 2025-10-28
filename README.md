@@ -134,6 +134,49 @@ python -m pytest -q
 
 ---
 
+## 监督 + 持续学习 + 自改 + 自发输出（本地 CPU 长跑）
+
+以下命令适合在本地 CPU 上进行“监督 + 持续学习 + 自改 + 自发输出”的联合长跑，所有产物均落地到 `runs/` 目录，便于审计与复盘。
+
+1) 生成可读的随机语料（按主题分布）
+
+```bash
+python - <<'PY'
+from tools.corpus_seed import write_corpus, random_topics
+for i,t in enumerate(random_topics()[:3]):
+    write_corpus(f"data/seed_{i}_{t}.txt", lines=800, topic_hint=t)
+print("seed corpora ready.")
+PY
+```
+
+2) 启动守护进程（RL + LM + 自改 + 发帖）
+
+```bash
+python scripts/daemon.py --loops rl,lm,autoadapt,post --poll-seconds 20 \
+  --rl-episodes 30 --lm-lines 1200 --post-len 200
+```
+
+观察产物（可审计）
+
+- runs/daemon.csv：联合循环的逐轮指标
+- runs/scheduler.csv：调度器奖励/能耗与下一步预算
+- runs/lm.csv：语言建模训练曲线（loss、ppl、Δppl、spikes）
+- runs/calibration.csv：自我模型校准指标（若相关脚本记录）
+- runs/autopatch.log：自动补丁引擎日志（锚点内修改 + A/B + 回滚）
+- runs/feed/*.md：自发“脉冲式”文本内容（spike_writer）
+- runs/self_report.md：每轮中文说明（做了什么、为何做、效果如何、是否回滚、下一步计划）
+
+风控与否决（QA/Contracts）
+
+- `tools/contracts.py` 实施补丁类别白名单（surrogate_expr、defaults_eta、defaults_lambda、meta_candidates）
+- 强制阈值：
+  - 单元测试全绿
+  - A/B Δ≥+0.02 或 ppl 至少下降 1.5%
+  - 能耗惩罚后净收益仍为正（默认 Δscore − 0.1·Δenergy > 0）
+- 否决即回滚：任一条件失败将自动 revert() 并在 `runs/self_report.md` 记录否决原因
+
+---
+
 ## 路线图（优先级）
 
 - **P0**：GridWorld 环境、策略头、元控制最小闭环、在线 e-prop、基本单测。
