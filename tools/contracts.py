@@ -51,6 +51,7 @@ class PatchDecision:
     patch_ppl: float = 0.0
     net_benefit: float = 0.0
     category: str = "unknown"
+    changed_files: tuple[str, ...] = ()
 
 
 def _timestamp() -> str:
@@ -265,6 +266,7 @@ def enforce_code_patch(patch_id: str) -> PatchDecision:
         patch_ppl=patch_ppl,
         net_benefit=net,
         category=category,
+        changed_files=tuple(changed),
     )
 
     if not accepted:
@@ -300,4 +302,3 @@ __all__ = [
     "ENERGY_PENALTY",
     "enforce_code_patch",
 ]
-

@@ -144,8 +144,9 @@ class MetaLearner:
         "switch_surrogate",
         "patch_surrogate",
         # 代码级补丁动作（由 meta.autopatch 执行）
-        # 可使用别名：code_patch:surrogate_rect / code_patch:defaults_eta_up 等
+        # 示例：code_patch:surrogate_rect / code_patch:decode_topk80
         "code_patch:surrogate_rect",
+        "code_patch:decode_topk80",
     ]
     # AUTOPATCH CANDIDATES END
 
@@ -299,12 +300,24 @@ class MetaLearner:
                     decision = qc.enforce_code_patch(patch_id)
                     applied = decision.accepted
                     energy_delta = decision.delta_energy
-                    if decision.accepted:
-                        info = (
-                            f"accepted Δ={decision.delta_score:+.3f} net={decision.net_benefit:+.3f}"
+                    changed_files = list(decision.changed_files)
+                    # 将 A/B 的 Δscore 用作本次 meta 改动的 delta，用于外部记录
+                    delta = float(decision.delta_score)
+                    # 生成中文解释
+                    if patch_id.startswith("decode"):
+                        explain = (
+                            f"我尝试把解码的 top-k 从 50 调到 80，以降低重复。"
                         )
+                    elif patch_id.startswith("surrogate"):
+                        explain = "我尝试将替代导数切换为矩形窗以增强梯度稀疏性。"
                     else:
-                        info = f"veto:{decision.reason}"
+                        explain = "我尝试应用一处安全补丁以优化生成行为。"
+                    kept = "已保留" if decision.accepted else "已回滚"
+                    dE = f"{decision.delta_energy:+.2f}"
+                    info = (
+                        f"{explain}A/B 指标 {decision.delta_score:+.2f}，能耗 {dE}，{kept}。"
+                        f"files={','.join(changed_files) if changed_files else '-'}"
+                    )
                 except Exception as exc:  # 安全兜底
                     applied = False
                     info = f"code_patch_error:{exc}"

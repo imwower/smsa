@@ -171,7 +171,15 @@ class AutoAdaptLoop:
             window=4,
             min_delta=0.01,
             ab_episodes=5,
-            actions=["eta_up", "eta_down", "vth_up", "vth_down"],
+            actions=[
+                "eta_up",
+                "eta_down",
+                "vth_up",
+                "vth_down",
+                # 注入代码补丁候选（示例）
+                "code_patch:decode_topk80",
+                "code_patch:surrogate_rect",
+            ],
         )
         self.agent = SimpleAutoAgent()
         self.step = 0
@@ -283,6 +291,9 @@ def run_autoadapt(loop: AutoAdaptLoop) -> Dict[str, object]:
             "next_plan": "继续触发 MetaLearner，如果 Δ<=0 切换策略",
         }
     )
+    # 将解释性说明写入 calibration_note，方便自述报告展示
+    if payload.get("note"):
+        payload["calibration_note"] = str(payload.get("note"))
     return payload
 
 
