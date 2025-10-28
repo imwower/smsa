@@ -106,7 +106,7 @@ def watch_corpus(
     patterns: str | Sequence[str],
     state_json: str | Path,
     *,
-    poll_seconds: float = 30.0,
+    poll_seconds: float = 60.0,
     ratios: Sequence[float] = _DEFAULT_RATIOS,
 ) -> Iterator[Dict[str, object]]:
     """Yield file descriptors whenever new corpus files appear."""
@@ -301,6 +301,10 @@ class DomainSampler:
                 _freeze_state(self.state_path, self._state)
 
         return iterator()
+
+    # 语义化别名：按行产出训练数据
+    def next_lines(self, num_lines: int) -> Iterator[str]:
+        return self.next_batch(num_lines)
 
     def record_delta(self, delta: float, path: str | Path | None = None) -> None:
         if path is None:
