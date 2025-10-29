@@ -93,7 +93,7 @@ def load_minicorpus(
         with dataset_path.open("r", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
-                if not line:
+                if not line or line.startswith("#"):
                     continue
                 data = json.loads(line)
                 # 兼容原始 minicorpus.jsonl

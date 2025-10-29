@@ -1,0 +1,62 @@
+{"text": "今天我们计划优化训练流程，观察回报曲线。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "中"}
+{"text": "因此我降低温度并增加 inner_steps，以便更稳定。", "domain": "学习", "intent": "信息", "tone": "中性", "urgency": "中"}
+{"text": "如果困惑度下降缓慢，那么尝试采样新主题继续学习。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "中"}
+{"text": "随后记录结果并准备下一步改动与目标。", "domain": "学习", "intent": "信息", "tone": "中性", "urgency": "中"}
+{"text": "我观察到奖励曲线在第十回合后趋于平缓。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "中"}
+{"text": "为了提升稳定性，我们适当提高了 v_th 并延长 inner_steps。", "domain": "学习", "intent": "建议", "tone": "中性", "urgency": "中"}
+{"text": "接下来将小步训练 200 行并检查 Δppl 走势。", "domain": "学习", "intent": "计划", "tone": "积极", "urgency": "中"}
+{"text": "若发现重复增多则提高 repeat_penalty 并降低温度。", "domain": "学习", "intent": "建议", "tone": "中性", "urgency": "中"}
+{"text": "MetaLearner 选择了 inner_up 并通过 A/B 验证后保留。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "低"}
+{"text": "自我模型的 NLL 较上轮有所下降，因果命中保持稳定。", "domain": "学习", "intent": "信息", "tone": "中性", "urgency": "低"}
+{"text": "我会尝试新的主题以改善上下文相关性。", "domain": "学习", "intent": "计划", "tone": "积极", "urgency": "低"}
+{"text": "如果 Δscore 为负则立即回滚补丁并记录原因。", "domain": "学习", "intent": "约束", "tone": "中性", "urgency": "中"}
+{"text": "观测显示平均发放率在安全范围内。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "低"}
+{"text": "为了降低能耗，考虑减少部分尖峰并优化节奏。", "domain": "学习", "intent": "建议", "tone": "中性", "urgency": "中"}
+{"text": "训练完成后将生成自述报告并附上关键指标。", "domain": "学习", "intent": "计划", "tone": "积极", "urgency": "低"}
+{"text": "我们在本轮保持 seed 不变以对齐 A/B 随机性。", "domain": "学习", "intent": "说明", "tone": "中性", "urgency": "低"}
+{"text": "自适应重试在两次尝试后达标，保留最佳方案。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "低"}
+{"text": "如果自指不足，则注入‘我/自己/此刻’的句式。", "domain": "学习", "intent": "建议", "tone": "中性", "urgency": "低"}
+{"text": "因为 Δppl 下降显著，所以继续当前解码配置。", "domain": "学习", "intent": "结论", "tone": "积极", "urgency": "低"}
+{"text": "于是我们在下一轮进一步微调 top_k。", "domain": "学习", "intent": "计划", "tone": "中性", "urgency": "低"}
+# repeated lines to ensure >= 120 records
+{"text": "今天我们计划优化训练流程，观察回报曲线。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "中"}
+{"text": "因此我降低温度并增加 inner_steps，以便更稳定。", "domain": "学习", "intent": "信息", "tone": "中性", "urgency": "中"}
+{"text": "如果困惑度下降缓慢，那么尝试采样新主题继续学习。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "中"}
+{"text": "随后记录结果并准备下一步改动与目标。", "domain": "学习", "intent": "信息", "tone": "中性", "urgency": "中"}
+{"text": "我观察到奖励曲线在第十回合后趋于平缓。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "中"}
+{"text": "为了提升稳定性，我们适当提高了 v_th 并延长 inner_steps。", "domain": "学习", "intent": "建议", "tone": "中性", "urgency": "中"}
+{"text": "接下来将小步训练 200 行并检查 Δppl 走势。", "domain": "学习", "intent": "计划", "tone": "积极", "urgency": "中"}
+{"text": "若发现重复增多则提高 repeat_penalty 并降低温度。", "domain": "学习", "intent": "建议", "tone": "中性", "urgency": "中"}
+{"text": "MetaLearner 选择了 inner_up 并通过 A/B 验证后保留。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "低"}
+{"text": "自我模型的 NLL 较上轮有所下降，因果命中保持稳定。", "domain": "学习", "intent": "信息", "tone": "中性", "urgency": "低"}
+{"text": "我会尝试新的主题以改善上下文相关性。", "domain": "学习", "intent": "计划", "tone": "积极", "urgency": "低"}
+{"text": "如果 Δscore 为负则立即回滚补丁并记录原因。", "domain": "学习", "intent": "约束", "tone": "中性", "urgency": "中"}
+{"text": "观测显示平均发放率在安全范围内。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "低"}
+{"text": "为了降低能耗，考虑减少部分尖峰并优化节奏。", "domain": "学习", "intent": "建议", "tone": "中性", "urgency": "中"}
+{"text": "训练完成后将生成自述报告并附上关键指标。", "domain": "学习", "intent": "计划", "tone": "积极", "urgency": "低"}
+{"text": "我们在本轮保持 seed 不变以对齐 A/B 随机性。", "domain": "学习", "intent": "说明", "tone": "中性", "urgency": "低"}
+{"text": "自适应重试在两次尝试后达标，保留最佳方案。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "低"}
+{"text": "如果自指不足，则注入‘我/自己/此刻’的句式。", "domain": "学习", "intent": "建议", "tone": "中性", "urgency": "低"}
+{"text": "因为 Δppl 下降显著，所以继续当前解码配置。", "domain": "学习", "intent": "结论", "tone": "积极", "urgency": "低"}
+{"text": "于是我们在下一轮进一步微调 top_k。", "domain": "学习", "intent": "计划", "tone": "中性", "urgency": "低"}
+# duplicate blocks to exceed 120 lines
+{"text": "今天我们计划优化训练流程，观察回报曲线。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "中"}
+{"text": "因此我降低温度并增加 inner_steps，以便更稳定。", "domain": "学习", "intent": "信息", "tone": "中性", "urgency": "中"}
+{"text": "如果困惑度下降缓慢，那么尝试采样新主题继续学习。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "中"}
+{"text": "随后记录结果并准备下一步改动与目标。", "domain": "学习", "intent": "信息", "tone": "中性", "urgency": "中"}
+{"text": "我观察到奖励曲线在第十回合后趋于平缓。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "中"}
+{"text": "为了提升稳定性，我们适当提高了 v_th 并延长 inner_steps。", "domain": "学习", "intent": "建议", "tone": "中性", "urgency": "中"}
+{"text": "接下来将小步训练 200 行并检查 Δppl 走势。", "domain": "学习", "intent": "计划", "tone": "积极", "urgency": "中"}
+{"text": "若发现重复增多则提高 repeat_penalty 并降低温度。", "domain": "学习", "intent": "建议", "tone": "中性", "urgency": "中"}
+{"text": "MetaLearner 选择了 inner_up 并通过 A/B 验证后保留。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "低"}
+{"text": "自我模型的 NLL 较上轮有所下降，因果命中保持稳定。", "domain": "学习", "intent": "信息", "tone": "中性", "urgency": "低"}
+{"text": "我会尝试新的主题以改善上下文相关性。", "domain": "学习", "intent": "计划", "tone": "积极", "urgency": "低"}
+{"text": "如果 Δscore 为负则立即回滚补丁并记录原因。", "domain": "学习", "intent": "约束", "tone": "中性", "urgency": "中"}
+{"text": "观测显示平均发放率在安全范围内。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "低"}
+{"text": "为了降低能耗，考虑减少部分尖峰并优化节奏。", "domain": "学习", "intent": "建议", "tone": "中性", "urgency": "中"}
+{"text": "训练完成后将生成自述报告并附上关键指标。", "domain": "学习", "intent": "计划", "tone": "积极", "urgency": "低"}
+{"text": "我们在本轮保持 seed 不变以对齐 A/B 随机性。", "domain": "学习", "intent": "说明", "tone": "中性", "urgency": "低"}
+{"text": "自适应重试在两次尝试后达标，保留最佳方案。", "domain": "学习", "intent": "信息", "tone": "积极", "urgency": "低"}
+{"text": "如果自指不足，则注入‘我/自己/此刻’的句式。", "domain": "学习", "intent": "建议", "tone": "中性", "urgency": "低"}
+{"text": "因为 Δppl 下降显著，所以继续当前解码配置。", "domain": "学习", "intent": "结论", "tone": "积极", "urgency": "低"}
+{"text": "于是我们在下一轮进一步微调 top_k。", "domain": "学习", "intent": "计划", "tone": "中性", "urgency": "低"}
