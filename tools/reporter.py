@@ -64,6 +64,32 @@ def write_episode_report(path: str | Path, data: Mapping[str, object]) -> None:
         else "Self-Model 自因概率未知"
     )
     calib_note = str(data.get("calibration_note") or "").strip()
+    # 若未提供校准说明，尝试自动生成：读取同目录下 self_model_metrics.csv
+    if not calib_note:
+        try:
+            metrics_csv = file_path.parent / "self_model_metrics.csv"
+            rho, brier, win = compute_calibration_from_metrics(metrics_csv, window=50)
+            rows = _read_csv_rows(metrics_csv)
+            conf = 0.0
+            acc = 0.0
+            if rows:
+                last = rows[-1]
+                conf = float(last.get("conf_next") or 0.0)
+                acc = float(last.get("acc_next") or 0.0)
+            # 判断偏高/偏低/一致（以 0.05 为阈值）
+            delta = conf - acc
+            if abs(delta) <= 0.05:
+                verdict = "基本一致"
+            elif delta > 0.05:
+                verdict = "偏高"
+            else:
+                verdict = "偏低"
+            calib_note = (
+                f"我对下一观测的置信度为 {conf:.2f}；过去 {win} 回合的校准相关 ρ={rho:.2f}，"
+                f"说明置信度与真实准确度{verdict}。"
+            )
+        except Exception:
+            calib_note = ""
     domain_info = str(data.get("domains_summary") or "").strip()
     # 语料来源（优先来自调用方，其次来自全局配置）
     corpus_path = str(data.get("corpus_path") or "").strip()
