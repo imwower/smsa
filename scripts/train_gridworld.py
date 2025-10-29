@@ -67,7 +67,12 @@ class EpropGridAgent:
         policy_lr: float = 0.06,
         intrinsic_beta: float = 0.35,
         baseline_beta: float = 0.05,
+        lambda_energy: float = 0.02,
+        homeo_on: bool = True,
+        homeo_target: float = 0.045,
+        homeo_kappa: float = 0.01,
         seed: int | None = None,
+        gamma_energy: float = 0.0,
     ) -> None:
         eta_e = max(1e-6, eta_e)
         lam_e = max(0.0, min(lam_e, 0.999))
@@ -93,6 +98,13 @@ class EpropGridAgent:
         self.surrogate_name = "fast_sigmoid"
         self._seed = seed or 0
         self._policy_seed = self._seed
+        # 能耗惩罚系数（用于优势函数调整）
+        self.lambda_energy = max(0.0, float(lambda_energy))
+        # 轻度阈值自稳：将放电率朝目标收敛
+        self.homeo_on = bool(homeo_on)
+        self.homeo_target = max(0.0, float(homeo_target))
+        self.homeo_kappa = max(0.0, float(homeo_kappa))
+        self.gamma_energy = max(0.0, float(gamma_energy))
         self.reseed(self._seed)
         self.temporal = LinearTemporalUnit(
             n_in=state_size,
@@ -167,9 +179,27 @@ class EpropGridAgent:
         reward: float,
     ) -> None:
         advantage = reward - self.baseline
+        # 能耗惩罚：adv ← adv - λ * (spikes/hidden_dim)
+        # 其中 spikes 为本决策步的总发放数，按 inner_steps 聚合。
+        hidden_dim = max(1, self.hidden.n_out)
+        step_spikes = sum(counts) * self.inner_steps
+        energy_penalty = self.lambda_energy * (step_spikes / float(hidden_dim))
+        advantage -= energy_penalty
+        # 轻度阈值自稳：v_th ← v_th + κ * (norm_spike - target)
+        if self.homeo_on:
+            norm_spike = (sum(counts) / float(hidden_dim)) if hidden_dim > 0 else 0.0
+            v_th = self.hidden.params.v_th
+            v_th += self.homeo_kappa * (norm_spike - self.homeo_target)
+            # 合理边界，避免失稳
+            v_th = max(0.2, min(1.2, v_th))
+            self.hidden.params.v_th = v_th
         grad = self.policy.policy_grad(probs, action)
         weights_snapshot = [row[:] for row in self.policy.weights]
         third_factor = self._learning_signal(grad, advantage, weights_snapshot)
+        # 在第三因子中加入轻度能耗抑制项（负向指向高发放神经元）
+        if self.gamma_energy > 0.0:
+            for j in range(len(third_factor)):
+                third_factor[j] -= self.gamma_energy * counts[j]
         self.policy.update(counts, grad, advantage)
         self.hidden.eprop_apply(third_factor, self.eta_e)
         self.baseline += self.baseline_beta * advantage
@@ -267,7 +297,7 @@ def _run_episode(
     self_model: SelfModel | None = None,
     buffer: ReplayBuffer | None = None,
     state_size: int | None = None,
-) -> Tuple[float, bool, float, float]:
+) -> Tuple[float, bool, float, float, float, float]:
     obs = env.reset()
     agent.begin_episode()
     total_reward = 0.0
@@ -276,6 +306,8 @@ def _run_episode(
     steps = 0
     done = False
     spike_sum = 0.0
+    norm_spike_accum = 0.0
+    energy_penalty_accum = 0.0
     while not done and steps < env.max_steps:
         counts = agent._integrate_counts(obs)
         probs = agent.policy.softmax(agent.policy.logits(counts))
@@ -312,7 +344,13 @@ def _run_episode(
         reward = base_reward + bonus
         total_reward += reward
         base_reward_sum += base_reward
-        spike_sum += sum(counts) * agent.inner_steps
+        step_spikes = sum(counts) * agent.inner_steps
+        spike_sum += step_spikes
+        # 统计归一化尖峰与能耗惩罚（用于日志）
+        hidden_dim = max(1, agent.hidden.n_out)
+        norm_spike_step = (sum(counts) / float(hidden_dim)) if hidden_dim > 0 else 0.0
+        norm_spike_accum += norm_spike_step
+        energy_penalty_accum += agent.lambda_energy * (step_spikes / float(hidden_dim))
         if training:
             agent.learn(counts, probs, action, reward)
             # train self-model on real transitions
@@ -340,7 +378,9 @@ def _run_episode(
             goal_reached = True
         obs = next_obs
         steps += 1
-    return total_reward, goal_reached, spike_sum, base_reward_sum
+    avg_norm_spikes = (norm_spike_accum / float(max(steps, 1))) if steps > 0 else 0.0
+    avg_energy_penalty = (energy_penalty_accum / float(max(steps, 1))) if steps > 0 else 0.0
+    return total_reward, goal_reached, spike_sum, base_reward_sum, avg_norm_spikes, avg_energy_penalty
 
 
 def _evaluate_agent(
@@ -357,7 +397,7 @@ def _evaluate_agent(
         env = env_cfg.make_env(seed=env_seed)
         agent.reseed(rng.randrange(1_000_000))
         visits: DefaultDict[int, int] = collections.defaultdict(int)
-        reward, _success, _spikes, _env_return = _run_episode(
+        reward, _success, _spikes, _env_return, _avg_norm, _avg_pen = _run_episode(
             agent,
             env,
             visits,
@@ -381,6 +421,11 @@ def train_gridworld(
     intrinsic_beta: float = 0.35,
     use_dream: bool = False,
     dream_every: int = 1,
+    lambda_energy: float = 0.02,
+    homeo_on: bool = True,
+    homeo_target: float = 0.045,
+    homeo_kappa: float = 0.01,
+    gamma_energy: float = 0.0,
 ) -> Dict[str, float]:
     if seed is not None:
         random.seed(seed)
@@ -391,7 +436,12 @@ def train_gridworld(
         eta_e=eta_e,
         lam_e=lam_e,
         intrinsic_beta=intrinsic_beta,
+        lambda_energy=lambda_energy,
+        homeo_on=homeo_on,
+        homeo_target=homeo_target,
+        homeo_kappa=homeo_kappa,
         seed=seed,
+        gamma_energy=gamma_energy,
     )
     state_size = env_cfg.size * env_cfg.size
     # Optional self-model + replay for dream augmentation
@@ -449,7 +499,7 @@ def train_gridworld(
             env_seed = (seed or 0) * 1009 + episode * 47 + 17
             env = env_cfg.make_env(seed=env_seed)
             agent.reseed(env_seed)
-            reward, success, spikes, env_return = _run_episode(
+            reward, success, spikes, env_return, avg_norm_spikes, avg_energy_penalty = _run_episode(
                 agent,
                 env,
                 visit_counts,
@@ -489,6 +539,15 @@ def train_gridworld(
                 if rolling_success
                 else 0.0
             )
+
+            # 每 N 回合打印一次能耗相关信息（不改 CSV 结构）
+            if episode % 10 == 0:
+                logger.info(
+                    "Energy: norm_spikes=%.4f energy_penalty=%.4f lambda=%.3f",
+                    float(avg_norm_spikes),
+                    float(avg_energy_penalty),
+                    float(agent.lambda_energy),
+                )
 
             metrics_logger.log(
                 {
@@ -563,7 +622,7 @@ def train_once(
             self_model=self_model,
             buffer=replay,
             state_size=state_size,
-        )
+        )[:4]
         total_reward += reward
         total_spikes += spikes
         if success:
@@ -643,6 +702,37 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.6,
         help="对权重添加高斯噪声的幅度 (0..1)",
+    )
+    parser.add_argument(
+        "--lambda-energy",
+        type=float,
+        default=0.02,
+        help="REINFORCE 优势的能耗惩罚系数 λ (adv -= λ * spikes/hidden_dim)",
+    )
+    parser.add_argument(
+        "--homeo",
+        type=str,
+        choices=["on", "off"],
+        default="on",
+        help="阈值自稳开关（将放电率朝目标收敛）",
+    )
+    parser.add_argument(
+        "--homeo-target",
+        type=float,
+        default=0.045,
+        help="自稳目标归一化放电率 (0..1)",
+    )
+    parser.add_argument(
+        "--homeo-kappa",
+        type=float,
+        default=0.01,
+        help="自稳步长 κ（每步阈值微调强度）",
+    )
+    parser.add_argument(
+        "--gamma-energy",
+        type=float,
+        default=0.0,
+        help="e-prop 第三因子中的能耗抑制权重（谨慎增大）",
     )
     return parser.parse_args()
 
@@ -781,6 +871,11 @@ def main() -> None:
         intrinsic_beta=args.intrinsic_beta,
         use_dream=(args.dream == "on"),
         dream_every=args.dream_every,
+        lambda_energy=args.lambda_energy,
+        homeo_on=(args.homeo == "on"),
+        homeo_target=args.homeo_target,
+        homeo_kappa=args.homeo_kappa,
+        gamma_energy=args.gamma_energy,
     )
     logger.info("Final metrics: %s", metrics)
 

@@ -53,6 +53,37 @@ python scripts/train_gridworld.py --episodes 80 --seed 0 \
 # 期望：平均回报随回合上升，终点成功率 ≥ 60%；当停滞时出现 [meta] 自改 / 回滚日志
 ```
 
+#### 能耗惩罚（REINFORCE）实验与复现
+
+- 改动摘要：
+  - 在训练环节将优势替换为 `adv ← adv − λ × (spikes/hidden_dim)`；
+  - 调度器评分加入 `energy_penalty` 并在 CSV 记录；
+  - 训练日志每 10 回合打印 `norm_spikes` 与 `energy_penalty`。
+
+- 快速复现（80 回合）：
+
+  1) 基线（λ=0）
+
+  ```bash
+  python scripts/train_gridworld.py --episodes 80 --seed 0 \
+    --lambda-energy 0 --homeo off --gamma-energy 0.0
+  ```
+
+  2) 加惩罚（命中验收范例）
+
+  ```bash
+  python scripts/train_gridworld.py --episodes 80 --seed 0 \
+    --lambda-energy 2.0 --homeo off --gamma-energy 0.0 --inner-steps 10
+  ```
+
+- 结果摘要（固定 seed=0）：
+  - 平均能耗（spikes 均值）：基线 102.41 → 惩罚 79.40（下降 22.47%）
+  - 成功率（尾窗）：基线 0.90 → 惩罚 0.90（无下降）
+  - 日志示例：`Energy: norm_spikes=0.0184 energy_penalty=0.3672 lambda=2.000`
+  - 产物：`runs/gridworld_metrics_baseline_e80_new.csv` 与 `runs/gridworld_metrics_penalty_lambda2_steps10_e80.csv`
+
+> 注：可通过 `--lambda-energy`、`--inner-steps` 微调折中；更长回合（300）下，λ∈[1.2,2.0] 亦能带来 5–9% 的能耗下降且成功率保持 1.00。
+
 ### 3) SMSA（Self-Model + 自调参 / 热补丁）
 
 ```bash
