@@ -138,7 +138,7 @@ python -m pytest -q
 
 以下命令适合在本地 CPU 上进行“监督 + 持续学习 + 自改 + 自发输出”的联合长跑，所有产物均落地到 `runs/` 目录，便于审计与复盘。
 
-1) 准备语料（使用配置项中的 dataset 语料库）
+1) 准备语料（两种方式）
 
 - 推荐：使用脚本拉取并展开数据集，然后通过 `--corpus-path` 写入统一配置，守护进程会读取该配置。
 
@@ -150,7 +150,19 @@ python scripts/daemon.py --loops lm --poll-seconds 0 --lm-lines 50 \
   --max-iterations 1 --corpus-path data/hf/webqa/train.txt
 ```
 
-2) 启动守护进程（RL + LM + 自改 + 发帖）
+或使用内置随机可读语料（模板+同义词扰动）
+
+```bash
+# 生成 3 份可读中文种子语料：data/seed_*.txt（每份 ≥800 行）
+python - <<'PY'
+from tools.corpus_seed import write_corpus, random_topics
+for i,t in enumerate(random_topics()[:3]):
+    write_corpus(f"data/seed_{i}_{t}.txt", lines=800, topic_hint=t)
+print("seed corpora ready.")
+PY
+```
+
+2) 启动守护进程（RL + LM + 自改 + 发帖 + 解释性门控）
 
 ```bash
 python scripts/daemon.py --loops rl,lm,autoadapt,post --poll-seconds 20 \
@@ -164,16 +176,17 @@ python scripts/daemon.py --loops rl,lm,autoadapt,post --poll-seconds 20 \
 - runs/lm.csv：语言建模训练曲线（loss、ppl、Δppl、spikes）
 - runs/calibration.csv：自我模型校准指标（若相关脚本记录）
 - runs/autopatch.log：自动补丁引擎日志（锚点内修改 + A/B + 回滚）
-- runs/feed/*.md：自发“脉冲式”文本内容（spike_writer）
+- runs/feed/*.md：自发“脉冲式”文本内容（每篇末尾包含 Explainability 指标）
 - runs/self_report.md：每轮中文说明（做了什么、为何做、效果如何、是否回滚、下一步计划）
+- 解释性不足时：自动调参/训练/补丁 → 重试 → 记录 runs/explain_log.md（“观测→诊断→干预→结果→下一步”）
 
 风控与否决（QA/Contracts）
 
-- `tools/contracts.py` 实施补丁类别白名单（surrogate_expr、defaults_eta、defaults_lambda、meta_candidates）
-- 强制阈值：
-  - 单元测试全绿
-  - A/B Δ≥+0.02 或 ppl 至少下降 1.5%
-  - 能耗惩罚后净收益仍为正（默认 Δscore − 0.1·Δenergy > 0）
+- `tools/contracts.py` 实施补丁类别白名单（surrogate / defaults / candidates / decode）与锚点外改动禁止；参数边界：eta_e∈[1e‑4,0.1]、lam_e∈[0.5,0.999]、inner_steps∈[4,30]、top_k∈[10,128]、repeat_penalty∈[1.0,2.0]
+- 强制阈值（满足其一，否则回滚）：
+  - post：explainability overall ≥ +0.05 且 |Δ能耗| ≤ 10%
+  - lm：perplexity 相对下降 ≥ 1.5%
+  - rl：平均回报提升 ≥ +0.02
 - 否决即回滚：任一条件失败将自动 revert() 并在 `runs/self_report.md` 记录否决原因
 
 ---

@@ -960,8 +960,14 @@ def train(args: argparse.Namespace) -> None:
             total_batches += 1
             continue
 
+        # Periodically trigger dream augmentation; otherwise run plain batches.
+        maybe_dream = (
+            dream_helper
+            if (getattr(args, "dream", "off") == "on" and args.dream_every > 0 and (total_batches % args.dream_every == 0))
+            else None
+        )
         avg_loss, avg_ppl, batch_ppls, tokens = run_batches(
-            model, vocab, batches, train=True, dream_helper=dream_helper
+            model, vocab, batches, train=True, dream_helper=maybe_dream
         )
         scheduler.set_pointer(file_idx, pointer_after)
         scheduler.total_batches += 1
@@ -1071,6 +1077,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--replay-ratio", type=float, default=0.3, help="Replay sequences per batch ratio.")
     parser.add_argument("--dream-ratio", type=float, default=0.2, help="Dream sequences per batch ratio.")
     parser.add_argument("--dream", type=str, choices=["on", "off"], default="off", help="Toggle dream augmentation on/off.")
+    parser.add_argument("--dream-every", type=int, default=5, help="Trigger dream every N batches (<=0 disables).")
     parser.add_argument("--dream-min-len", type=int, default=3, help="Minimum dream sequence length.")
     parser.add_argument("--dream-max-len", type=int, default=5, help="Maximum dream sequence length.")
     parser.add_argument("--replay-warmup", type=int, default=64, help="Minimum sequences before enabling replay/dream.")
@@ -1084,6 +1091,9 @@ def train_lines(
     sampler: "DomainSampler | None" = None,
     valid_interval: int = 200,
     log_path: str | Path | None = None,
+    use_dream: bool = False,
+    dream_every: int = 20,
+    dream_k: int = 3,
 ) -> Dict[str, object]:
     """Lightweight LM training used by daemon loops."""
     global LM_CSV_PATH
@@ -1163,10 +1173,24 @@ def train_lines(
     total_spikes = 0.0
     lines_trained = 0
     lines_since_eval = 0
+    lines_since_dream = 0
     valid_interval = max(1, min(valid_interval, target_lines))
     prev_logged_ppl = _read_last_valid_ppl()
     last_valid = None
     last_delta = 0.0
+
+    dream_helper: Optional[DreamHelper] = None
+    if use_dream:
+        dream_helper = DreamHelper(
+            vocab=vocab,
+            capacity=max(512, min(4096, target_lines * 2)),
+            replay_ratio=0.0,  # not used in periodic dream mode
+            dream_ratio=0.0,   # gated manually below
+            min_fill=max(64, min(256, target_lines // 4)),
+            min_len=3,
+            max_len=5,
+            seed=(seed or 0) + 23,
+        )
 
     for tokens in collected:
         seq = [TOKEN_BOS] + tokens + [TOKEN_EOS]
@@ -1177,8 +1201,34 @@ def train_lines(
             loss = model.update(state, vocab.encode(seq[idx + 1]), train=True)
             total_loss += loss
             total_tokens += 1
+        # update dream buffer/model with real sequence
+        if dream_helper is not None:
+            try:
+                dream_helper._update_model_for_sequence(tokens)  # type: ignore[attr-defined]
+            except Exception:
+                pass
         lines_trained += 1
         lines_since_eval += 1
+        lines_since_dream += 1
+
+        # Periodically trigger dream sequences and train on them
+        if dream_helper is not None and dream_every > 0 and lines_since_dream >= dream_every:
+            try:
+                dream_samples = dream_helper._dream_samples(max(1, int(dream_k)))  # type: ignore[attr-defined]
+            except Exception:
+                dream_samples = []
+            for dseq in dream_samples:
+                if not dseq:
+                    continue
+                seq = [TOKEN_BOS] + dseq + [TOKEN_EOS]
+                model.reset_temporal()
+                for idx in range(len(seq) - 1):
+                    state = model.forward(seq[idx])
+                    total_spikes += sum(state.hidden_rates) * model.inner_steps
+                    loss = model.update(state, vocab.encode(seq[idx + 1]), train=True)
+                    total_loss += loss
+                    total_tokens += 1
+            lines_since_dream = 0
         if lines_since_eval >= valid_interval:
             last_valid = _evaluate_ppl(model, vocab, valid_sequences)
             avg_loss = total_loss / float(max(1, total_tokens))
@@ -1199,6 +1249,12 @@ def train_lines(
                 files=file_counts,
                 topics=topic_counts,
             )
+            # 将本轮验证的 Δppl 回写到采样器，驱动 UCB 选择。
+            try:
+                if sampler is not None and delta is not None and math.isfinite(delta):
+                    sampler.record_delta(float(delta))
+            except Exception:
+                pass
             prev_logged_ppl = last_valid
             last_delta = delta
             lines_since_eval = 0
@@ -1223,6 +1279,12 @@ def train_lines(
             files=file_counts,
             topics=topic_counts,
         )
+        # 末次评估也回写 Δppl 以更新 DomainSampler 的统计。
+        try:
+            if sampler is not None and delta is not None and math.isfinite(delta):
+                sampler.record_delta(float(delta))
+        except Exception:
+            pass
         prev_logged_ppl = last_valid
         last_delta = delta
 

@@ -380,6 +380,7 @@ def train_gridworld(
     inner_steps: int = 12,
     intrinsic_beta: float = 0.35,
     use_dream: bool = False,
+    dream_every: int = 1,
 ) -> Dict[str, float]:
     if seed is not None:
         random.seed(seed)
@@ -475,8 +476,8 @@ def train_gridworld(
                     logger.info(log_line)
                 return_history.clear()
             parse_meta(meta_logs)
-            # Optional dream augmentation after each real episode
-            if use_dream:
+            # Optional dream augmentation every N episodes
+            if use_dream and dream_every > 0 and (episode % dream_every == 0):
                 try:
                     replay.dream(agent, self_model, state_size=state_size, sequences=3)
                 except Exception:
@@ -527,6 +528,8 @@ def train_once(
     seed: int | None = None,
     *,
     env_cfg: GridWorldConfig | None = None,
+    use_dream: bool = False,
+    dream_every: int = 0,
 ) -> Tuple[float, float, float]:
     """Lightweight train loop used by background daemons."""
     env_cfg = env_cfg or GridWorldConfig()
@@ -542,6 +545,12 @@ def train_once(
     total_reward = 0.0
     total_spikes = 0.0
     successes = 0
+    # Optional dream components
+    state_size = env_cfg.size * env_cfg.size
+    self_params = LIFParams(v_th=0.5, tau_m=10.0, tau_a=20.0, beta=0.35, refractory=2)
+    self_model = SelfModel(obs_dim=state_size, action_dim=4, hidden_size=24, lif_params=self_params) if use_dream else None
+    replay = ReplayBuffer(capacity=2000) if use_dream else None
+
     for episode in range(1, episodes + 1):
         env_seed = (seed or 0) * 2029 + episode * 131
         env = env_cfg.make_env(seed=env_seed)
@@ -551,11 +560,19 @@ def train_once(
             env,
             visit_counts,
             training=True,
+            self_model=self_model,
+            buffer=replay,
+            state_size=state_size,
         )
         total_reward += reward
         total_spikes += spikes
         if success:
             successes += 1
+        if use_dream and dream_every > 0 and (episode % dream_every == 0) and replay is not None and self_model is not None:
+            try:
+                replay.dream(agent, self_model, state_size=state_size, sequences=3)
+            except Exception:
+                pass
     count = float(max(episodes, 1))
     avg_return = total_reward / count
     success_rate = successes / count
@@ -598,7 +615,133 @@ def parse_args() -> argparse.Namespace:
         default="off",
         help="开启/关闭 Self-Model 梦样本混合微调",
     )
+    parser.add_argument(
+        "--dream-every",
+        type=int,
+        default=1,
+        help="每 N 个 episode 触发一次 dream (N<=0 关闭)",
+    )
+    parser.add_argument(
+        "--compare-dream",
+        action="store_true",
+        help="运行一次干扰-恢复对比，打印 dream off/on 恢复步数",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=40,
+        help="干扰前的预热回合数",
+    )
+    parser.add_argument(
+        "--recover-window",
+        type=int,
+        default=10,
+        help="计算滚动成功率/回报的窗口大小",
+    )
+    parser.add_argument(
+        "--perturb-scale",
+        type=float,
+        default=0.6,
+        help="对权重添加高斯噪声的幅度 (0..1)",
+    )
     return parser.parse_args()
+
+
+def _perturb_agent(agent: EpropGridAgent, scale: float) -> None:
+    """Inject noise into hidden and policy parameters to simulate forgetting."""
+    scale = max(0.0, min(scale, 1.0))
+    rng = random.Random(12345)
+    # Hidden weights/bias
+    for i in range(agent.hidden.n_in):
+        row = agent.hidden.weights[i]
+        for j in range(agent.hidden.n_out):
+            row[j] = (1.0 - scale) * row[j] + rng.gauss(0.0, 0.1) * scale
+    for j in range(agent.hidden.n_out):
+        agent.hidden.bias[j] = (1.0 - scale) * agent.hidden.bias[j] + rng.gauss(0.0, 0.05) * scale
+    agent.hidden.reset_state()
+    # Policy head weights/bias
+    for a in range(len(agent.policy.weights)):
+        for j in range(len(agent.policy.weights[a])):
+            agent.policy.weights[a][j] = (1.0 - scale) * agent.policy.weights[a][j] + rng.gauss(0.0, 0.1) * scale
+    for a in range(len(agent.policy.bias)):
+        agent.policy.bias[a] = (1.0 - scale) * agent.policy.bias[a] + rng.gauss(0.0, 0.05) * scale
+
+
+def _recover_compare(
+    *,
+    env_cfg: GridWorldConfig,
+    seed: int | None,
+    warmup: int,
+    window: int,
+    perturb_scale: float,
+    dream_every: int,
+) -> None:
+    # Common components
+    state_size = env_cfg.size * env_cfg.size
+    self_params = LIFParams(v_th=0.5, tau_m=10.0, tau_a=20.0, beta=0.35, refractory=2)
+
+    def run_one(use_dream: bool) -> int:
+        agent = EpropGridAgent(
+            state_size=state_size,
+            inner_steps=12,
+            eta_e=0.035,
+            lam_e=0.9,
+            intrinsic_beta=0.35,
+            seed=seed,
+        )
+        self_model = SelfModel(obs_dim=state_size, action_dim=4, hidden_size=24, lif_params=self_params)
+        replay = ReplayBuffer(capacity=3000)
+        visits: DefaultDict[int, int] = collections.defaultdict(int)
+        rolling_success: collections.deque[int] = collections.deque(maxlen=window)
+        # warmup to establish baseline
+        for ep in range(1, warmup + 1):
+            env_seed = (seed or 0) * 1009 + ep * 47 + 17
+            env = env_cfg.make_env(seed=env_seed)
+            agent.reseed(env_seed)
+            _, success, _, _ = _run_episode(
+                agent, env, visits, training=True, self_model=self_model, buffer=replay, state_size=state_size
+            )
+            rolling_success.append(1 if success else 0)
+            if use_dream and dream_every > 0 and (ep % dream_every == 0):
+                try:
+                    replay.dream(agent, self_model, state_size=state_size, sequences=3)
+                except Exception:
+                    pass
+        baseline = sum(rolling_success) / float(max(1, len(rolling_success)))
+        # perturb
+        _perturb_agent(agent, perturb_scale)
+        # recover: count episodes to reach >=90% of baseline
+        target = 0.9 * baseline
+        steps = 0
+        # avoid infinite loop; cap at 3x warmup
+        limit = max(10, 3 * warmup)
+        while steps < limit:
+            steps += 1
+            env_seed = (seed or 0) * 2003 + steps * 73 + 31
+            env = env_cfg.make_env(seed=env_seed)
+            agent.reseed(env_seed)
+            _, success, _, _ = _run_episode(
+                agent, env, visits, training=True, self_model=self_model, buffer=replay, state_size=state_size
+            )
+            rolling_success.append(1 if success else 0)
+            if use_dream and dream_every > 0 and (steps % dream_every == 0):
+                try:
+                    replay.dream(agent, self_model, state_size=state_size, sequences=3)
+                except Exception:
+                    pass
+            metric = sum(rolling_success) / float(max(1, len(rolling_success)))
+            if metric >= target and len(rolling_success) >= window:
+                break
+        return steps
+
+    off_steps = run_one(False)
+    on_steps = run_one(True)
+    print(f"[compare] dream=off recover_steps={off_steps}")
+    print(f"[compare] dream=on  recover_steps={on_steps}")
+    if on_steps < off_steps:
+        print(f"[result] Dream reduces recovery steps by {(off_steps - on_steps)} episodes.")
+    else:
+        print("[result] No improvement observed; consider tuning dream_every/scale.")
 
 
 def main() -> None:
@@ -607,6 +750,21 @@ def main() -> None:
     logger = get_logger(__name__)
     if args.corpus_path:
         write_corpus_config_for_path(args.corpus_path)
+    if args.compare_dream:
+        _recover_compare(
+            env_cfg=GridWorldConfig(
+                slip_prob=args.slip_prob,
+                step_cost=args.step_cost,
+                goal_reward=args.goal_reward,
+                max_steps=args.max_steps,
+            ),
+            seed=args.seed,
+            warmup=args.warmup,
+            window=args.recover_window,
+            perturb_scale=args.perturb_scale,
+            dream_every=args.dream_every,
+        )
+        return
     env_cfg = GridWorldConfig(
         slip_prob=args.slip_prob,
         step_cost=args.step_cost,
@@ -622,6 +780,7 @@ def main() -> None:
         inner_steps=args.inner_steps,
         intrinsic_beta=args.intrinsic_beta,
         use_dream=(args.dream == "on"),
+        dream_every=args.dream_every,
     )
     logger.info("Final metrics: %s", metrics)
 
