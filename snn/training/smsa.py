@@ -516,14 +516,9 @@ def train_smsa(
                 }
             )
 
-            # 计算并记录校准指标
+            # 计算并记录校准指标（自述报告由 reporter 自动追加说明）
             rho, brier, win = compute_calibration_from_metrics(csv_path, window=50)
             append_calibration_row(Path(output_dir) / "calibration.csv", episode, rho, brier, win)
-            # 构建一句话描述并写入自报告
-            note = (
-                f"我预测下一观测的置信度 {conf_next:.2f}；过去 {win} 回合的校准相关 ρ={rho:.2f}，"
-                "说明置信度与真实准确度基本一致。"
-            )
             write_episode_report(
                 Path(output_dir) / "self_report.md",
                 {
@@ -538,7 +533,6 @@ def train_smsa(
                     "cause_prob_self": cause_prob_self,
                     "corpus_path": find_train_corpus_from_config() or "",
                     "next_plan": "继续探索并校准自我模型",
-                    "calibration_note": note,
                 },
             )
 
