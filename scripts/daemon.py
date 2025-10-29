@@ -39,6 +39,9 @@ DAEMON_FIELDS = [
     "meta_action",
     "delta",
     "reverted",
+    "relearned",
+    "retuned",
+    "patched",
     "note",
 ]
 
@@ -304,6 +307,7 @@ def run_post(
     temperature: float = 1.0,
     attempts: int = 3,
     post_thresholds: Dict[str, float] | None = None,
+    sampler: "DomainSampler | None" = None,
 ) -> Dict[str, object]:
     """调用 SupervisedPost 进行解释性门控与自适应重试。"""
     thresholds = post_thresholds or {"overall": 0.62, "self_explain": 0.40}
@@ -325,11 +329,77 @@ def run_post(
         attempts=[],
     )
     text_path = _write_feed(gen, topic_hint, length, temperature)
-    trained = any("ntp:" in a for a in res.get("actions", []))
-    patched = any("autopatch" in a for a in res.get("actions", []))
+    actions_list = list(res.get("actions", []))
+    trained = any("ntp:" in a for a in actions_list)
+    patched = any("autopatch" in a for a in actions_list)
+    retuned = any(("temperature" in a) or ("top_k" in a) or ("repeat_penalty" in a) for a in actions_list)
     attempts_used = int(res.get("attempts", 1) or 1)
     best_act = str(res.get("best_action") or "baseline")
-    note = f"post attempts={attempts_used} best={best_act} trained={trained} patched={patched} feed={Path(text_path).name}"
+    note = f"post attempts={attempts_used} best={best_act} trained={trained} patched={patched} retuned={retuned} feed={Path(text_path).name}"
+
+    # 自动继续学：overall<0.5 或 tokens<80 时触发，优先按 topic 选择域
+    def _topic_biased_sampler(base: "DomainSampler | None", topic: str | None):
+        if base is None or not topic:
+            return base
+        class _Wrap:
+            def __init__(self, inner, hint: str):
+                self.inner = inner
+                self.hint = hint
+                # expose attributes used by train_lines
+                self.state_path = getattr(inner, "state_path", None)
+            def next_lines(self, num_lines: int):
+                # 尝试优先选择 topic 匹配的文件
+                for _ in range(10):
+                    it = self.inner.next_lines(num_lines)
+                    try:
+                        meta = self.inner.metadata_for(self.inner.last_file())
+                        if isinstance(meta, dict) and self.hint and str(meta.get("topic", "")).find(self.hint) >= 0:
+                            return it
+                    except Exception:
+                        pass
+                return self.inner.next_lines(num_lines)
+            def metadata_for(self, path=None):
+                return self.inner.metadata_for(path)
+            def last_file(self):
+                return self.inner.last_file()
+        return _Wrap(base, topic)
+
+    tokens = len(text)
+    relearned = False
+    if (score < 0.5) or (tokens < 80):
+        try:
+            from scripts.snn_text_lm import train_lines as _train_lines
+            biased = _topic_biased_sampler(sampler, topic_hint)
+            _ = _train_lines(1000, sampler=biased)
+            relearned = True
+            # 再次生成
+            sp2 = SupervisedPost(attempts=max(3, attempts))
+            res2 = sp2.run(topic=topic_hint, max_len=max(length, 120))
+            text2 = str(res2.get("text", ""))
+            score2 = float(res2.get("score", 0.0) or 0.0)
+            details2 = res2.get("details", {}) if isinstance(res2.get("details"), dict) else {}
+            read2 = float(details2.get("readability", 0.0) or 0.0)
+            ctx2 = float(details2.get("context", 0.0) or 0.0)
+            # 覆盖 feed
+            gen2 = GenerationResult(
+                text=text2,
+                tokens_generated=len(text2),
+                spike_estimate=0.0,
+                readability=read2,
+                context=ctx2,
+                notes=list(details2.get("notes", [])) if isinstance(details2.get("notes"), list) else [],
+                attempts=[],
+            )
+            text_path = _write_feed(gen2, topic_hint, length, temperature)
+            # 记录改参/补丁标记
+            actions_list2 = list(res2.get("actions", []))
+            trained = trained or any("ntp:" in a for a in actions_list2)
+            patched = patched or any("autopatch" in a for a in actions_list2)
+            retuned = retuned or any(("temperature" in a) or ("top_k" in a) or ("repeat_penalty" in a) for a in actions_list2)
+            note += f" retrain_then_retry=True delta_overall={score2 - score:+.3f}"
+            text = text2; score = score2; read = read2; ctx = ctx2
+        except Exception as exc:
+            note += f" retrain_then_retry=False err={exc}"
     return {
         "task": "post",
         "reward": score,
@@ -352,6 +422,8 @@ def run_post(
         "post_best_action": best_act,
         "post_trained": trained,
         "post_patched": patched,
+        "post_relearned": relearned,
+        "post_retuned": retuned,
         "post_threshold_overall": thresholds.get("overall", 0.62),
         "post_threshold_self": thresholds.get("self_explain", 0.40),
     }
@@ -376,6 +448,9 @@ def build_report_payload(iteration: int, metrics: Dict[str, object]) -> Dict[str
         "readability": metrics.get("readability"),
         "text_path": metrics.get("text_path"),
         "corpus_path": metrics.get("corpus_path") or find_train_corpus_from_config() or "",
+        "relearned": metrics.get("post_relearned", False),
+        "retuned": metrics.get("post_retuned", False),
+        "patched": metrics.get("post_patched", False),
     }
 
 
@@ -406,6 +481,9 @@ def log_daemon_metrics(iteration: int, metrics: Dict[str, object]) -> None:
             "meta_action": metrics.get("meta_action", ""),
             "delta": f"{metrics.get('delta', 0.0):.6f}",
             "reverted": metrics.get("reverted", False),
+            "relearned": metrics.get("post_relearned", False),
+            "retuned": metrics.get("post_retuned", False),
+            "patched": metrics.get("post_patched", False),
             "note": metrics.get("note", ""),
         }
     )
@@ -424,6 +502,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lm-lines", type=int, default=500, help="Lines per LM update.")
     parser.add_argument("--corpus-path", type=str, default="", help="Optional explicit corpus text file path.")
     parser.add_argument("--post-len", type=int, default=220, help="Maximum characters per post generation.")
+    parser.add_argument("--post-topic", type=str, default="", help="Optional topic hint for post generation.")
     parser.add_argument("--post-fail-max", type=int, default=POST_FAIL_MAX, help="Max consecutive under-threshold posts before forced lm+autoadapt.")
     parser.add_argument("--post-threshold", type=float, default=0.62, help="Overall score threshold for supervised post.")
     parser.add_argument("--post-min-self", type=float, default=0.40, help="Self-explain score threshold for supervised post.")
@@ -480,13 +559,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 length = int(getattr(selection, "budget", args.post_len))
                 metrics = run_post(
                     length,
-                    topic_hint=None,
+                    topic_hint=(args.post_topic or None),
                     temperature=1.0,
                     attempts=3,
                     post_thresholds={
                         "overall": float(args.post_threshold),
                         "self_explain": float(args.post_min_self),
                     },
+                    sampler=lm_sampler,
                 )
                 # 解释性门控：连续不达标则强制调度一次 lm 与 autoadapt
                 passed = (
@@ -514,9 +594,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 best_act = metrics.get("post_best_action", "baseline")
                 trained = metrics.get("post_trained", False)
                 patched = metrics.get("post_patched", False)
+                relearned = metrics.get("post_relearned", False)
+                retuned = metrics.get("post_retuned", False)
                 payload["calibration_note"] = (
                     f"解释性尝试 {attempts_used} 次；最佳动作 {best_act}；"
-                    f"触发训练 {bool(trained)}；触发补丁 {bool(patched)}。"
+                    f"继续学 {bool(relearned)}；改参 {bool(retuned)}；补丁 {bool(patched)}；训练 {bool(trained)}。"
                 )
             log_daemon_metrics(iteration, metrics)
             write_episode_report("runs/self_report.md", payload)
