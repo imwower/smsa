@@ -322,6 +322,7 @@ def run_post(
         readability=read,
         context=ctx,
         notes=list(details.get("notes", [])) if isinstance(details.get("notes"), list) else [],
+        attempts=[],
     )
     text_path = _write_feed(gen, topic_hint, length, temperature)
     trained = any("ntp:" in a for a in res.get("actions", []))

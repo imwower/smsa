@@ -76,17 +76,17 @@ def write_episode_report(path: str | Path, data: Mapping[str, object]) -> None:
                 last = rows[-1]
                 conf = float(last.get("conf_next") or 0.0)
                 acc = float(last.get("acc_next") or 0.0)
-            # 判断偏高/偏低/一致（以 0.05 为阈值）
-            delta = conf - acc
-            if abs(delta) <= 0.05:
-                verdict = "基本一致"
-            elif delta > 0.05:
-                verdict = "偏高"
-            else:
+            # 文案映射（按 conf 阈值）：
+            # conf < 0.25 → “偏低”；0.25 ≤ conf ≤ 0.75 → “基本匹配”；> 0.75 → “偏高”
+            if conf < 0.25:
                 verdict = "偏低"
+            elif conf <= 0.75:
+                verdict = "基本匹配"
+            else:
+                verdict = "偏高"
             calib_note = (
                 f"我对下一观测的置信度为 {conf:.2f}；过去 {win} 回合的校准相关 ρ={rho:.2f}，"
-                f"说明置信度与真实准确度{verdict}。"
+                f"说明置信度水平{verdict}。"
             )
         except Exception:
             calib_note = ""
@@ -106,11 +106,61 @@ def write_episode_report(path: str | Path, data: Mapping[str, object]) -> None:
         if isinstance(delta_ppl, (int, float)):
             parts.append(f"验证困惑度改善 Δ{delta_ppl:+.3f}")
         extra_line = "- " + "，".join(parts)
-    lines = [f"### Episode {episode} · 任务：{task}", f"- 核心指标：{indicators}"]
+    # RL 能耗箭头：与上一回合对比（基于 runs/daemon.csv 最近两条 RL 记录）
+    energy_arrow = ""
+    try:
+        if str(task) == "rl":
+            daemon_csv = file_path.parent / "daemon.csv"
+            prev_e, curr_e = _last_two_task_energy(daemon_csv, task="rl")
+            if prev_e is None or curr_e is None:
+                energy_arrow = "→"
+            else:
+                if curr_e > prev_e + 1e-9:
+                    energy_arrow = "↑"
+                elif curr_e < prev_e - 1e-9:
+                    energy_arrow = "↓"
+                else:
+                    energy_arrow = "→"
+    except Exception:
+        energy_arrow = ""
+
+    arrow_suffix = (f"（能耗 vs 上一回合：{energy_arrow}）" if energy_arrow else "")
+    lines = [
+        f"### Episode {episode} · 任务：{task}",
+        f"- 核心指标：{indicators}{arrow_suffix}",
+    ]
     if extra_line:
         lines.append(extra_line)
     if corpus_path:
         lines.append(f"- 语料来源：{corpus_path}")
+    # Post 空样本标注（tokens==0 或 spikes==0）：从 feed 元数据读取 tokens 与解码参数
+    try:
+        if str(task) == "post":
+            energy_val = 0.0
+            try:
+                val = data.get("energy")
+                energy_val = float(val) if isinstance(val, (int, float)) else 0.0
+            except Exception:
+                energy_val = 0.0
+            feed_path = Path(str(data.get("text_path", "") or ""))
+            feed_info = _read_feed_info(feed_path) if feed_path.is_file() else {}
+            tokens_count = int(feed_info.get("tokens", -1)) if feed_info.get("tokens") is not None else -1
+            is_empty = (tokens_count == 0) or (energy_val == 0.0)
+            if is_empty:
+                parts: List[str] = []
+                if feed_info.get("T") is not None:
+                    parts.append(f"T={feed_info['T']:.2f}")
+                if feed_info.get("top_k") is not None:
+                    parts.append(f"top_k={int(feed_info['top_k'])}")
+                if feed_info.get("repeat_penalty") is not None:
+                    parts.append(f"repeat_penalty={float(feed_info['repeat_penalty']):.2f}")
+                if feed_info.get("trigram") is not None:
+                    parts.append(f"trigram={int(feed_info['trigram'])}")
+                param_text = " ".join(parts) if parts else "无解码参数记录"
+                lines.append(f"- [空样本] 解码参数：{param_text}")
+    except Exception:
+        pass
+
     lines.extend(
         [
             f"- 本次自改：{meta_text}",
@@ -123,6 +173,74 @@ def write_episode_report(path: str | Path, data: Mapping[str, object]) -> None:
     content = "\n".join(lines)
     with file_path.open("a", encoding="utf-8") as handle:
         handle.write(content)
+
+
+def _last_two_task_energy(csv_path: Path, task: str) -> tuple[float | None, float | None]:
+    rows = _read_csv_rows(csv_path)
+    rl_rows = [r for r in rows if r.get("task") == task]
+    if not rl_rows:
+        return None, None
+    # 取最后两条 RL 记录，注意当前调用发生在日志追加之后
+    if len(rl_rows) == 1:
+        try:
+            curr = float(rl_rows[-1].get("spikes") or 0.0)
+        except (TypeError, ValueError):
+            curr = None  # type: ignore[assignment]
+        return None, curr
+    try:
+        prev = float(rl_rows[-2].get("spikes") or 0.0)
+    except (TypeError, ValueError):
+        prev = None  # type: ignore[assignment]
+    try:
+        curr = float(rl_rows[-1].get("spikes") or 0.0)
+    except (TypeError, ValueError):
+        curr = None  # type: ignore[assignment]
+    return prev, curr
+
+
+def _read_feed_info(feed_path: Path) -> Dict[str, object]:
+    info: Dict[str, object] = {}
+    try:
+        with feed_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("- Generated Tokens:"):
+                    try:
+                        info["tokens"] = int(line.split(":", 1)[1].strip())
+                    except Exception:
+                        pass
+                elif line.startswith("- Temperature:"):
+                    try:
+                        info["T"] = float(line.split(":", 1)[1].strip())
+                    except Exception:
+                        pass
+                elif line.startswith("- Attempts:"):
+                    # 读取第一条尝试参数（若存在）
+                    # 下一行通常以 "- [try#...] | T=... | top_k=... | repeat_penalty=... | trigram=..." 形式
+                    continue  # header 本行略过，后续逐行处理
+                elif line.startswith("- ") and "[try#" in line:
+                    parts = [seg.strip() for seg in line[1:].split("|")]
+                    for seg in parts:
+                        if seg.startswith("top_k="):
+                            try:
+                                info["top_k"] = int(seg.split("=", 1)[1])
+                            except Exception:
+                                pass
+                        elif seg.startswith("repeat_penalty="):
+                            try:
+                                info["repeat_penalty"] = float(seg.split("=", 1)[1])
+                            except Exception:
+                                pass
+                        elif seg.startswith("trigram="):
+                            try:
+                                info["trigram"] = int(seg.split("=", 1)[1])
+                            except Exception:
+                                pass
+                    # 只读取第一条尝试
+                    break
+    except OSError:
+        return info
+    return info
 
 
 def _read_conf_acc(path: Path, window: int) -> tuple[list[float], list[float]]:
