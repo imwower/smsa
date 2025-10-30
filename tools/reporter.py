@@ -86,7 +86,7 @@ def write_episode_report(path: str | Path, data: Mapping[str, object]) -> None:
                 verdict = "偏高"
             calib_note = (
                 f"我对下一观测的置信度为 {conf:.2f}；过去 {win} 回合的校准相关 ρ={rho:.2f}，"
-                f"说明置信度与真实准确度{verdict}。"
+                f"说明我的置信{verdict}。"
             )
         except Exception:
             calib_note = ""

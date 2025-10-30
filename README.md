@@ -164,6 +164,8 @@ python scripts/train_smsa.py --episodes 80 --seed 0 --corpus-path data/hf/webqa/
   - 置信度文案映射：`conf < 0.25` → “偏低”；`0.25 ≤ conf ≤ 0.75` → “基本匹配”；`conf > 0.75` → “偏高”。
   - 空样本标注：当 tokens==0 或 spikes==0 时，在 `runs/self_report.md` 标注“[空样本] 解码参数：T=… top_k=… repeat_penalty=… trigram=…”。
   - RL 能耗箭头：核心指标后追加“（能耗 vs 上一回合：↑/↓/→）”，基于 `runs/daemon.csv` 最近两条 RL 记录的 `spikes` 对比。
+  - 校准话术示例：
+    “我对下一观测的置信度为 {conf:.2f}；过去 50 回合的校准相关 ρ={rho:.2f}，说明我的置信{偏高/偏低/基本匹配}。”
 
 ---
 
