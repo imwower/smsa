@@ -77,16 +77,16 @@ def write_episode_report(path: str | Path, data: Mapping[str, object]) -> None:
                 conf = float(last.get("conf_next") or 0.0)
                 acc = float(last.get("acc_next") or 0.0)
             # 文案映射（按 conf 阈值）：
-            # conf < 0.25 → “偏低”；0.25 ≤ conf ≤ 0.75 → “基本匹配”；> 0.75 → “偏高”
+            # conf < 0.25 → “偏低”；0.25 ≤ conf ≤ 0.75 → “基本一致”；> 0.75 → “偏高”
             if conf < 0.25:
                 verdict = "偏低"
             elif conf <= 0.75:
-                verdict = "基本匹配"
+                verdict = "基本一致"
             else:
                 verdict = "偏高"
             calib_note = (
                 f"我对下一观测的置信度为 {conf:.2f}；过去 {win} 回合的校准相关 ρ={rho:.2f}，"
-                f"说明置信度水平{verdict}。"
+                f"说明置信度与真实准确度{verdict}。"
             )
         except Exception:
             calib_note = ""
