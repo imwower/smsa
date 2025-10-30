@@ -10,7 +10,7 @@ import random
 from pathlib import Path
 from typing import Iterable, Iterator, List, Sequence
 
-__all__ = ["generate_sentences", "write_corpus"]
+__all__ = ["generate_sentences", "write_corpus", "random_topics"]
 
 
 _SUBJECTS = [
@@ -73,7 +73,20 @@ def _choice_group(rng: random.Random, groups: Sequence[Sequence[str]]) -> str:
     return _choice(rng, _choice(rng, groups))
 
 
-def generate_sentences(n: int, *, seed: int | None = None) -> List[str]:
+def random_topics() -> List[str]:
+    """Return a deterministic list of generic Chinese topic labels."""
+    return [
+        "science", "life", "news", "sports", "tech",
+        "finance", "education", "health", "travel", "culture",
+    ]
+
+
+def generate_sentences(
+    n: int,
+    *,
+    seed: int | None = None,
+    topic_hint: str | None = None,
+) -> List[str]:
     """Generate n short Chinese sentences with mild variability.
 
     The generator stitches together simple subject–verb–object clauses, with
@@ -91,6 +104,7 @@ def generate_sentences(n: int, *, seed: int | None = None) -> List[str]:
         r = _choice_group(rng, _RESULTS)
         # Two-clause template with causal connective
         # e.g., 我们逐步分析数据，因为提出了新方案，因此提升了效果。
+        topic_token = f"（{topic_hint}）" if topic_hint else ""
         parts = [
             s,
             adv,
@@ -104,6 +118,7 @@ def generate_sentences(n: int, *, seed: int | None = None) -> List[str]:
             "，",
             c2,
             r,
+            topic_token,
         ]
         text = "".join(parts) + _choice(rng, _ENDINGS)
         # Minor punctuation cleanup / style tweak
@@ -112,17 +127,26 @@ def generate_sentences(n: int, *, seed: int | None = None) -> List[str]:
     return lines
 
 
-def write_corpus(path: str | Path, num_lines: int, *, seed: int | None = None) -> Path:
+def write_corpus(
+    path: str | Path,
+    num_lines: int | None = None,
+    *,
+    lines: int | None = None,
+    seed: int | None = None,
+    topic_hint: str | None = None,
+) -> Path:
     """Write a plain-text corpus file with the requested number of lines.
 
     Returns the absolute Path to the created file.
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    lines = generate_sentences(num_lines, seed=seed)
+    total = int(lines if lines is not None else (num_lines if num_lines is not None else 0))
+    if total <= 0:
+        total = 800
+    seq = generate_sentences(total, seed=seed, topic_hint=topic_hint)
     with p.open("w", encoding="utf-8") as fh:
-        for line in lines:
+        for line in seq:
             fh.write(line)
             fh.write("\n")
     return p.resolve()
-
