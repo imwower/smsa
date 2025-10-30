@@ -126,7 +126,13 @@ class AdaptationLog:
 
 
 class MetaLearner:
-    """使用 UCB 选择自改动作，并通过 A/B 测试验证。"""
+    """使用 UCB 选择自改动作，并通过 A/B 测试验证。
+
+    扩展：支持 code_patch:<id> 动作，按以下安全流程执行：
+    apply_patch → static_checks → smoke_test → A/B(5回合) → 保留/回滚；
+    并将「补丁 id、受影响文件、Δ、是否回滚、能耗差」写入守护进程日志，
+    同时生成一句中文解释便于自述报告展示。
+    """
 
     # AUTOPATCH CANDIDATES START
     DEFAULT_ACTIONS = [
@@ -144,9 +150,9 @@ class MetaLearner:
         "switch_surrogate",
         "patch_surrogate",
         # 代码级补丁动作（由 meta.autopatch 执行）
-        # 示例：code_patch:surrogate_rect / code_patch:decode_topk80
+        # 示例：code_patch:surrogate_rect / code_patch:decode_topk_80
         "code_patch:surrogate_rect",
-        "code_patch:decode_topk80",
+        "code_patch:decode_topk_80",
     ]
     # AUTOPATCH CANDIDATES END
 
@@ -290,43 +296,155 @@ class MetaLearner:
             trial_agent = copy.deepcopy(agent)
             applied = False
             info: str | None = None
-            # 新增：代码补丁动作
+            # 新增：代码补丁动作（使用 meta.autopatch 简化流程，A/B 5 回合）
             changed_files: list[str] | None = None
-            energy_delta: float | None = None
+            energy_delta_mean: float | None = None
             if action.startswith("code_patch:"):
+                from meta import autopatch as ap  # 延迟导入（标准库内）
+
+                raw_id = action.split(":", 1)[1].strip()
+                # 兼容别名：decode_topk_80 → decode:topk80 等
+                alias = raw_id.replace("-", "_")
+                synonyms = {
+                    "decode_topk_80": "decode:topk80",
+                    "decode:topk_80": "decode:topk80",
+                    "decode_topk80": "decode:topk80",
+                    "surrogate_rect": "surrogate:rect",
+                    "surrogate-rect": "surrogate:rect",
+                }
+                patch_id = synonyms.get(alias, raw_id)
+
+                # 1) apply → static → smoke
+                delta_scores: list[float] = []
+                delta_energies: list[float] = []
                 try:
-                    from tools import contracts as qc
-                    patch_id = action.split(":", 1)[1]
-                    decision = qc.enforce_code_patch(patch_id)
-                    applied = decision.accepted
-                    energy_delta = decision.delta_energy
-                    changed_files = list(decision.changed_files)
-                    # 将 A/B 的 Δscore 用作本次 meta 改动的 delta，用于外部记录
-                    delta = float(decision.delta_score)
-                    # 生成中文解释
-                    if patch_id.startswith("decode"):
-                        explain = (
-                            f"我尝试把解码的 top-k 从 50 调到 80，以降低重复。"
-                        )
-                    elif patch_id.startswith("surrogate"):
-                        explain = "我尝试将替代导数切换为矩形窗以增强梯度稀疏性。"
-                    else:
-                        explain = "我尝试应用一处安全补丁以优化生成行为。"
-                    kept = "已保留" if decision.accepted else "已回滚"
-                    dE = f"{decision.delta_energy:+.2f}"
-                    info = (
-                        f"{explain}A/B 指标 {decision.delta_score:+.2f}，能耗 {dE}，{kept}。"
-                        f"files={','.join(changed_files) if changed_files else '-'}"
-                    )
-                except Exception as exc:  # 安全兜底
+                    changed, backups = ap.apply_patch(patch_id)
+                    changed_files = list(changed)
+                except Exception as exc:
                     applied = False
-                    info = f"code_patch_error:{exc}"
+                    info = f"code_patch_apply_failed:{patch_id}:{exc}"
+                    # 计数更新并记录日志
+                    self.counts[action] += 1
+                    self.totals[action] += 0.0
+                    self.attempts += 1
+                    log = AdaptationLog(
+                        step=step,
+                        action=action,
+                        delta=0.0,
+                        reverted=True,
+                        info=info,
+                        positive_ratio=self.positive_ratio(),
+                    )
+                    messages.append(log.format())
+                    print(messages[-1])
+                    # 失败后尝试下一动作
+                    continue
+
+                if not ap.static_checks(changed):
+                    applied = False
+                    info = f"code_patch_static_failed:{patch_id}"
+                    self.counts[action] += 1
+                    self.totals[action] += 0.0
+                    self.attempts += 1
+                    log = AdaptationLog(
+                        step=step,
+                        action=action,
+                        delta=0.0,
+                        reverted=True,
+                        info=info,
+                        positive_ratio=self.positive_ratio(),
+                    )
+                    messages.append(log.format())
+                    print(messages[-1])
+                    continue
+
+                if not ap.smoke_test():
+                    applied = False
+                    info = f"code_patch_smoke_failed:{patch_id}"
+                    self.counts[action] += 1
+                    self.totals[action] += 0.0
+                    self.attempts += 1
+                    log = AdaptationLog(
+                        step=step,
+                        action=action,
+                        delta=0.0,
+                        reverted=True,
+                        info=info,
+                        positive_ratio=self.positive_ratio(),
+                    )
+                    messages.append(log.format())
+                    print(messages[-1])
+                    continue
+
+                # 2) A/B 5 回合（post 指标），聚合均值
+                for _ in range(5):
+                    ds, de = ap.ab_evaluate(kind="post")
+                    delta_scores.append(float(ds))
+                    delta_energies.append(float(de))
+                mean_ds = self._mean(delta_scores)
+                mean_de = self._mean(delta_energies)
+                energy_delta_mean = mean_de
+
+                # 3) 决策：均值 Δ>=0 保留；否则回滚到首次备份
+                accepted_patch = mean_ds >= 0.0
+                try:
+                    if accepted_patch:
+                        ap.apply_patch(patch_id)  # 确保最终状态为补丁版
+                    else:
+                        ap.revert(backups)  # 回到初始快照
+                except Exception:
+                    pass
+
+                # 4) 生成中文解释与外部可读信息
+                kept = "已保留" if accepted_patch else "已回滚"
+                if patch_id.startswith("decode") and "topk" in patch_id:
+                    explain_prefix = "我尝试把解码的 top‑k 从 50 调到 80，以降低重复。"
+                elif patch_id.startswith("surrogate"):
+                    explain_prefix = "我尝试将替代导数切换为矩形窗以增强梯度的稀疏性。"
+                else:
+                    explain_prefix = "我尝试应用一处安全补丁以优化模型行为。"
+                # 能耗文案
+                if abs(mean_de) <= 100.0:
+                    energy_text = "能耗基本不变"
+                else:
+                    energy_text = f"能耗变化 {mean_de:+.0f}"
+                info = (
+                    f"{explain_prefix}A/B 的解释性指标 {mean_ds:+.2f}，{energy_text}，{kept}。"
+                    f" files={','.join(changed_files) if changed_files else '-'}"
+                )
+
+                # 5) 将聚合 Δ 用于 UCB 统计，并更新 attempts/positives
+                delta = float(mean_ds)
+                self.counts[action] += 1
+                self.totals[action] += delta
+                self.attempts += 1
+                reverted = not accepted_patch
+                if delta > 0.0:
+                    self._positives += 1
+
+                log = AdaptationLog(
+                    step=step,
+                    action=action,
+                    delta=delta,
+                    reverted=reverted,
+                    info=info,
+                    positive_ratio=self.positive_ratio(),
+                )
+                message = log.format()
+                messages.append(message)
+                print(message)
+                # 采用后即停止本轮
+                if accepted_patch:
+                    accepted = True
+                    agent = trial_agent  # agent 无结构变更，仅作为占位
+                break
             else:
                 if hasattr(trial_agent, "apply_modification"):
                     applied, info = trial_agent.apply_modification(action)
                 else:
                     info = "missing apply_modification"
 
+            # 常规参数改动路径
             delta = 0.0
             reverted = True
             if applied:
