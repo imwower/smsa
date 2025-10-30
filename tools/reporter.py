@@ -77,11 +77,11 @@ def write_episode_report(path: str | Path, data: Mapping[str, object]) -> None:
                 conf = float(last.get("conf_next") or 0.0)
                 acc = float(last.get("acc_next") or 0.0)
             # 文案映射（按 conf 阈值）：
-            # conf < 0.25 → “偏低”；0.25 ≤ conf ≤ 0.75 → “基本一致”；> 0.75 → “偏高”
+            # conf < 0.25 → “偏低”；0.25 ≤ conf ≤ 0.75 → “基本匹配”；> 0.75 → “偏高”
             if conf < 0.25:
                 verdict = "偏低"
             elif conf <= 0.75:
-                verdict = "基本一致"
+                verdict = "基本匹配"
             else:
                 verdict = "偏高"
             calib_note = (

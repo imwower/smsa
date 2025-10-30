@@ -160,6 +160,11 @@ python scripts/train_smsa.py --episodes 80 --seed 0 --corpus-path data/hf/webqa/
 - **自改质量**：触发频率、Δ 回报 / Δ ppl 分布、回滚比例。
 - **日志输出**：默认打印到控制台，可写 CSV 至 `runs/` 目录；`runs/exp_*/metrics.csv` 包含回合、回报、能耗、NLL、`meta_action`、`delta`、`reverted` 等列。
 
+- 报告话术规则（tools/reporter.py）：
+  - 置信度文案映射：`conf < 0.25` → “偏低”；`0.25 ≤ conf ≤ 0.75` → “基本匹配”；`conf > 0.75` → “偏高”。
+  - 空样本标注：当 tokens==0 或 spikes==0 时，在 `runs/self_report.md` 标注“[空样本] 解码参数：T=… top_k=… repeat_penalty=… trigram=…”。
+  - RL 能耗箭头：核心指标后追加“（能耗 vs 上一回合：↑/↓/→）”，基于 `runs/daemon.csv` 最近两条 RL 记录的 `spikes` 对比。
+
 ---
 
 ## 测试
