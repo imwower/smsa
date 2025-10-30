@@ -144,6 +144,18 @@ _RECIPES: Dict[str, List[PatchRecipe]] = {
             ),
         )
     ],
+    # Spike-Writer：重复惩罚 1.15（保持当前 top-k 不变或显式设置）
+    "decode:repeat_115": [
+        PatchRecipe(
+            file=DECODE_FILE,
+            strategy="anchor-replace",
+            anchor="decode_params",
+            content=(
+                "# 默认解码参数（可由 AutoPatch 在锚点内调整)\n"
+                "DECODE_TOP_K = 80\n\nDECODE_REPEAT_PENALTY = 1.15\n"
+            ),
+        )
+    ],
     # Spike-Writer：关闭 trigram 阻断
     "decode:logic_no_trigram": [
         PatchRecipe(
@@ -158,6 +170,24 @@ _RECIPES: Dict[str, List[PatchRecipe]] = {
                 "    top_k=DECODE_TOP_K,\n"
                 "    repeat_penalty=DECODE_REPEAT_PENALTY,\n"
                 "    trigram_block=False,\n"
+                ")\n"
+            ),
+        )
+    ],
+    # Spike-Writer：开启 trigram 阻断
+    "decode:trigram_on": [
+        PatchRecipe(
+            file=DECODE_FILE,
+            strategy="anchor-replace",
+            anchor="decode_logic",
+            content=(
+                "# 可由 AutoPatch 切换 trigram 阻断/采样策略\n"
+                "sample_id = sample_token(\n"
+                "    logits,\n"
+                "    temperature=temperature,\n"
+                "    top_k=DECODE_TOP_K,\n"
+                "    repeat_penalty=DECODE_REPEAT_PENALTY,\n"
+                "    trigram_block=True,\n"
                 ")\n"
             ),
         )

@@ -150,9 +150,11 @@ class MetaLearner:
         "switch_surrogate",
         "patch_surrogate",
         # 代码级补丁动作（由 meta.autopatch 执行）
-        # 示例：code_patch:surrogate_rect / code_patch:decode_topk_80
+        # 示例：code_patch:surrogate_rect / code_patch:decode_topk_80 / code_patch:decode_repeat_115 / code_patch:decode_trigram_on
         "code_patch:surrogate_rect",
         "code_patch:decode_topk_80",
+        "code_patch:decode_repeat_115",
+        "code_patch:decode_trigram_on",
     ]
     # AUTOPATCH CANDIDATES END
 
@@ -309,6 +311,10 @@ class MetaLearner:
                     "decode_topk_80": "decode:topk80",
                     "decode:topk_80": "decode:topk80",
                     "decode_topk80": "decode:topk80",
+                    "decode_repeat_115": "decode:repeat_115",
+                    "decode:repeat_115": "decode:repeat_115",
+                    "decode_trigram_on": "decode:trigram_on",
+                    "decode:trigram_on": "decode:trigram_on",
                     "surrogate_rect": "surrogate:rect",
                     "surrogate-rect": "surrogate:rect",
                 }
@@ -386,7 +392,7 @@ class MetaLearner:
                 energy_delta_mean = mean_de
 
                 # 3) 决策：均值 Δ>=0 保留；否则回滚到首次备份
-                accepted_patch = mean_ds >= 0.0
+                accepted_patch = mean_ds >= 0.05
                 try:
                     if accepted_patch:
                         ap.apply_patch(patch_id)  # 确保最终状态为补丁版
@@ -399,6 +405,10 @@ class MetaLearner:
                 kept = "已保留" if accepted_patch else "已回滚"
                 if patch_id.startswith("decode") and "topk" in patch_id:
                     explain_prefix = "我尝试把解码的 top‑k 从 50 调到 80，以降低重复。"
+                elif patch_id.startswith("decode") and ("repeat" in patch_id or "repeat_115" in patch_id):
+                    explain_prefix = "我尝试把解码的重复惩罚调整为 1.15，以抑制回圈。"
+                elif patch_id.startswith("decode") and ("trigram" in patch_id):
+                    explain_prefix = "我尝试开启 trigram 阻断以减少三词回环。"
                 elif patch_id.startswith("surrogate"):
                     explain_prefix = "我尝试将替代导数切换为矩形窗以增强梯度的稀疏性。"
                 else:
