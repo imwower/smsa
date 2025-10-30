@@ -84,6 +84,29 @@ python scripts/train_gridworld.py --episodes 80 --seed 0 \
 
 > 注：可通过 `--lambda-energy`、`--inner-steps` 微调折中；更长回合（300）下，λ∈[1.2,2.0] 亦能带来 5–9% 的能耗下降且成功率保持 1.00。
 
+#### Post 门控（继续学 + 再试）
+
+- 触发条件：`overall < 0.5` 或 `tokens < 80` 时，守护进程自动进行“继续学 + 再试”。
+- 动作细节：
+  - 采用微批增量训练：每批 `600` 行，最多累计至 `~3000` 行或超时 `3 分钟`；每训练一批立即再试一次生成。
+  - 采样偏向主题域：若给定 `--post-topic`，训练数据优先选用父目录名匹配该主题的文件。
+  - 再试时自动注入因果引导种子（含“因为…所以…”句式），提升自解释分与整体分。
+- 记录项：
+  - `runs/daemon.csv` 新增列：`relearned`（是否继续学）、`retuned`（是否改解码参数）、`patched`（是否补丁）。
+  - `runs/self_report.md` 中“校准说明”一行会包含“继续学/改参/补丁/训练”的布尔标记；若空样本（`tokens==0` 或 `spikes==0`），会标注 `[空样本] 解码参数：...`。
+
+复现（直到出现 ≥+0.1 提升的样例，建议 3–5 轮）：
+
+```bash
+python scripts/daemon.py --loops post --poll-seconds 0 \
+  --max-iterations 5 --post-len 60 --post-topic 学习 \
+  --post-threshold 0.5 --post-min-self 0.4
+```
+
+期望：
+- `runs/daemon.csv` 出现一行包含 `retrain_then_retry=True`，并在 `note` 中带有 `delta_overall=+0.121`（或 ≥+0.1 的正提升），同时 `relearned=True`。
+- `runs/self_report.md` 对应回合的条目显示 `[空样本]`（若为空样本）、“继续学 True；改参 True/False；补丁 True/False；训练 True/False”等话术。
+
 ### 3) SMSA（Self-Model + 自调参 / 热补丁）
 
 ```bash
