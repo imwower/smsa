@@ -379,13 +379,14 @@ def run_post(
             delta_best = -1e9
             score0 = score
             res2 = None
+            seed_inject = "因为我们观察到目标不够清晰，所以我们先提出问题，再用例子推演，随后总结。"
             while used < max_total and (time.time() - start_ts) < 180.0:
                 _ = _train_lines(chunk, sampler=biased)
                 used += chunk
                 relearned = True
                 # 再次生成
                 sp2 = SupervisedPost(attempts=max(3, attempts))
-                res2 = sp2.run(topic=topic_hint, max_len=max(length, 200))
+                res2 = sp2.run(topic=topic_hint, max_len=max(length, 200), seed_text=seed_inject)
                 score2 = float(res2.get("score", 0.0) or 0.0)
                 delta = score2 - score0
                 delta_best = max(delta_best, delta)

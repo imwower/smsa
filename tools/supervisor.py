@@ -130,7 +130,7 @@ class SupervisedPost:
 
     # --- 生成与打分 ---------------------------------------------------------
     @staticmethod
-    def _generate(topic: Optional[str], max_len: int, cfg: DecodeConfig) -> Tuple[str, Mapping[str, float], List[str]]:
+    def _generate(topic: Optional[str], max_len: int, cfg: DecodeConfig, *, seed_text: str = "") -> Tuple[str, Mapping[str, float], List[str]]:
         # 动态注入解码参数到 spike_writer 模块的全局（标准库能力）
         from scripts import spike_writer as sw
         from tools.explainability import explainability_index
@@ -139,7 +139,7 @@ class SupervisedPost:
         sw.DECODE_REPEAT_PENALTY = float(cfg.repeat_penalty)
         result = sw.spike_generate(
             max_len=max_len,
-            seed_text="",
+            seed_text=seed_text,
             temperature=float(cfg.temperature),
             topic_hint=topic,
         )
@@ -154,7 +154,7 @@ class SupervisedPost:
         return result.text, score, notes
 
     # --- 主流程 -------------------------------------------------------------
-    def run(self, *, topic: str | None = None, max_len: int = 160) -> Dict[str, object]:
+    def run(self, *, topic: str | None = None, max_len: int = 160, seed_text: str = "") -> Dict[str, object]:
         from tools.explainability import explainability_index, suggest_actions
 
         log_file = self.log_path
@@ -164,7 +164,7 @@ class SupervisedPost:
         executed_actions: List[str] = []
 
         for idx in range(1, self.attempts + 1):
-            text, score, notes = self._generate(topic, max_len, cfg)
+            text, score, notes = self._generate(topic, max_len, cfg, seed_text=seed_text)
             rec = AttemptRecord(
                 idx=idx,
                 decode=DecodeConfig(cfg.temperature, cfg.top_k, cfg.repeat_penalty),
@@ -262,4 +262,3 @@ class SupervisedPost:
 
 
 __all__ = ["SupervisedPost"]
-
