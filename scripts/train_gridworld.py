@@ -788,18 +788,20 @@ def _recover_compare(
             env_seed = (seed or 0) * 1009 + ep * 47 + 17
             env = env_cfg.make_env(seed=env_seed)
             agent.reseed(env_seed)
-            _, success, _, _ = _run_episode(
+            _, success, _, _, _, _ = _run_episode(
                 agent, env, visits, training=True, self_model=self_model, buffer=replay, state_size=state_size
             )
             rolling_success.append(1 if success else 0)
             if use_dream and dream_every > 0 and (ep % dream_every == 0):
                 try:
-                    replay.dream(agent, self_model, state_size=state_size, sequences=3)
+                    replay.dream(agent, self_model, state_size=state_size, sequences=5)
                 except Exception:
                     pass
         baseline = sum(rolling_success) / float(max(1, len(rolling_success)))
         # perturb
         _perturb_agent(agent, perturb_scale)
+        # reset post-perturb rolling window to measure true recovery steps
+        rolling_success.clear()
         # recover: count episodes to reach >=90% of baseline
         target = 0.9 * baseline
         steps = 0
@@ -810,13 +812,13 @@ def _recover_compare(
             env_seed = (seed or 0) * 2003 + steps * 73 + 31
             env = env_cfg.make_env(seed=env_seed)
             agent.reseed(env_seed)
-            _, success, _, _ = _run_episode(
+            _, success, _, _, _, _ = _run_episode(
                 agent, env, visits, training=True, self_model=self_model, buffer=replay, state_size=state_size
             )
             rolling_success.append(1 if success else 0)
             if use_dream and dream_every > 0 and (steps % dream_every == 0):
                 try:
-                    replay.dream(agent, self_model, state_size=state_size, sequences=3)
+                    replay.dream(agent, self_model, state_size=state_size, sequences=5)
                 except Exception:
                     pass
             metric = sum(rolling_success) / float(max(1, len(rolling_success)))

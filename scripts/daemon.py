@@ -215,8 +215,20 @@ class AutoAdaptLoop:
         }
 
 
-def run_rl(episodes: int) -> Dict[str, object]:
-    avg_return, success_rate, spikes = train_once(episodes=episodes, seed=int(time.time()) & 0xFFFF)
+def run_rl(episodes: int, *, iteration: int | None = None, dream_period: int = 0) -> Dict[str, object]:
+    """Run a short RL session; optionally enable dream every N daemon iterations."""
+    use_dream = False
+    dream_every = 0
+    if isinstance(iteration, int) and dream_period and dream_period > 0:
+        if (iteration % dream_period) == 0:
+            use_dream = True
+            dream_every = 1  # trigger dream rollout each episode this round
+    avg_return, success_rate, spikes = train_once(
+        episodes=episodes,
+        seed=int(time.time()) & 0xFFFF,
+        use_dream=use_dream,
+        dream_every=dream_every,
+    )
     prev = _RL_HISTORY.get("avg_return")
     delta_return = avg_return - prev if isinstance(prev, (int, float)) else avg_return
     _RL_HISTORY["avg_return"] = avg_return
@@ -519,6 +531,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--poll-seconds", type=int, default=30, help="Sleep interval between tasks.")
     parser.add_argument("--rl-episodes", type=int, default=20, help="Episodes per RL call.")
+    parser.add_argument("--rl-dream-period", type=int, default=0, help="Trigger dream on RL task every N daemon iterations (0=disabled).")
     parser.add_argument("--lm-lines", type=int, default=500, help="Lines per LM update.")
     parser.add_argument("--corpus-path", type=str, default="", help="Optional explicit corpus text file path.")
     parser.add_argument("--post-len", type=int, default=220, help="Maximum characters per post generation.")
@@ -571,7 +584,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 continue
             if task == "rl":
                 episodes = int(getattr(selection, "budget", args.rl_episodes))
-                metrics = run_rl(episodes)
+                metrics = run_rl(episodes, iteration=iteration + 1, dream_period=int(args.rl_dream_period))
             elif task == "lm":
                 num_lines = int(getattr(selection, "budget", args.lm_lines))
                 metrics = run_lm(num_lines, sampler=lm_sampler)
