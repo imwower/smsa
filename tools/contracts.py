@@ -221,6 +221,73 @@ def _enforce_anchor_whitelist(changed_files: Sequence[str]) -> tuple[bool, str]:
     return ok, "; ".join(reasons)
 
 
+def _span_between(text: str, start_tag: str, end_tag: str) -> tuple[int, int]:
+    s = text.find(start_tag)
+    e = text.find(end_tag)
+    if s == -1 or e == -1 or e < s:
+        return -1, -1
+    return s + len(start_tag), e
+
+
+def _enforce_param_bounds(changed_files: Sequence[str]) -> tuple[bool, str]:
+    """Check parameter bounds inside anchored regions only.
+
+    Enforces hard limits:
+      - 0.5 ≤ LAM_E_DEFAULT ≤ 0.999
+      - 1e-4 ≤ ETA_E_DEFAULT ≤ 0.1
+      - 10 ≤ DECODE_TOP_K ≤ 128
+      - 1.0 ≤ DECODE_REPEAT_PENALTY ≤ 2.0
+    """
+    ok = True
+    reasons: list[str] = []
+    anchors = ap.ANCHORS  # type: ignore[attr-defined]
+    for rel in changed_files:
+        full = ap.ROOT / rel  # type: ignore[attr-defined]
+        try:
+            data = full.read_text(encoding="utf-8")
+        except OSError:
+            ok = False
+            reasons.append(f"无法读取文件以检查参数边界: {rel}")
+            continue
+        amap = anchors.get(rel, {})
+        for name, (start_tag, end_tag) in amap.items():
+            s, e = _span_between(data, start_tag, end_tag)
+            if s == -1:
+                continue
+            block = data[s:e]
+            # defaults: ETA_E_DEFAULT / LAM_E_DEFAULT
+            m = re.search(r"ETA_E_DEFAULT\s*=\s*([0-9]*\.?[0-9]+)", block)
+            if m:
+                val = float(m.group(1))
+                lo, hi = BOUNDS["eta_e"]
+                if not (lo <= val <= hi):
+                    ok = False
+                    reasons.append(f"ETA_E_DEFAULT 越界: {val} not in [{lo}, {hi}]")
+            m = re.search(r"LAM_E_DEFAULT\s*=\s*([0-9]*\.?[0-9]+)", block)
+            if m:
+                val = float(m.group(1))
+                lo, hi = BOUNDS["lam_e"]
+                if not (lo <= val <= hi):
+                    ok = False
+                    reasons.append(f"LAM_E_DEFAULT 越界: {val} not in [{lo}, {hi}]")
+            # decode params: DECODE_TOP_K / DECODE_REPEAT_PENALTY
+            m = re.search(r"DECODE_TOP_K\s*=\s*([0-9]+)", block)
+            if m:
+                val = int(m.group(1))
+                lo, hi = BOUNDS["top_k"]
+                if not (lo <= val <= hi):
+                    ok = False
+                    reasons.append(f"DECODE_TOP_K 越界: {val} not in [{lo}, {hi}]")
+            m = re.search(r"DECODE_REPEAT_PENALTY\s*=\s*([0-9]*\.?[0-9]+)", block)
+            if m:
+                val = float(m.group(1))
+                lo, hi = BOUNDS["repeat_penalty"]
+                if not (lo <= val <= hi):
+                    ok = False
+                    reasons.append(f"DECODE_REPEAT_PENALTY 越界: {val} not in [{lo}, {hi}]")
+    return ok, "; ".join(reasons)
+
+
 def _run_full_tests() -> bool:
     import unittest
     loader = unittest.TestLoader()
