@@ -365,7 +365,22 @@ def run_post(
                     it = self.inner.next_lines(num_lines)
                     try:
                         meta = self.inner.metadata_for(self.inner.last_file())
-                        if isinstance(meta, dict) and self.hint and str(meta.get("topic", "")).find(self.hint) >= 0:
+                        name_hit = False
+                        try:
+                            from pathlib import Path as _P
+                            lf = self.inner.last_file()
+                            if lf:
+                                name_hit = (str(_P(lf).name).find(self.hint) >= 0)
+                        except Exception:
+                            name_hit = False
+                        if (
+                            isinstance(meta, dict)
+                            and self.hint
+                            and (
+                                str(meta.get("topic", "")).find(self.hint) >= 0
+                                or name_hit
+                            )
+                        ):
                             return it
                     except Exception:
                         pass
@@ -382,31 +397,13 @@ def run_post(
         try:
             from scripts.snn_text_lm import train_lines as _train_lines
             biased = _topic_biased_sampler(sampler, topic_hint)
-            # 采用微批训练，最多累计 ~3000 行，或超时 3 分钟即停
-            target_delta = 0.10
-            chunk = 600
-            max_total = 3000
-            used = 0
-            start_ts = time.time()
-            delta_best = -1e9
-            score0 = score
-            res2 = None
+            # 单次继续学：与 topic 相关的域优先，训练 1000 行后立即再试
+            _ = _train_lines(1000, sampler=biased, valid_interval=500)
+            relearned = True
             seed_inject = "因为我们观察到目标不够清晰，所以我们先提出问题，再用例子推演，随后总结。"
-            while used < max_total and (time.time() - start_ts) < 180.0:
-                _ = _train_lines(chunk, sampler=biased)
-                used += chunk
-                relearned = True
-                # 再次生成
-                sp2 = SupervisedPost(attempts=max(3, attempts))
-                res2 = sp2.run(topic=topic_hint, max_len=max(length, 200), seed_text=seed_inject)
-                score2 = float(res2.get("score", 0.0) or 0.0)
-                delta = score2 - score0
-                delta_best = max(delta_best, delta)
-                if delta >= target_delta:
-                    break
-            # 用最后一次或最佳一次的结果
-            if res2 is None:
-                raise RuntimeError("retrain retry failed: no result")
+            sp2 = SupervisedPost(attempts=max(3, attempts))
+            res2 = sp2.run(topic=topic_hint, max_len=max(length, 200), seed_text=seed_inject)
+            score2 = float(res2.get("score", 0.0) or 0.0)
             text2 = str(res2.get("text", ""))
             score2 = float(res2.get("score", 0.0) or 0.0)
             details2 = res2.get("details", {}) if isinstance(res2.get("details"), dict) else {}
@@ -428,7 +425,7 @@ def run_post(
             trained = trained or any("ntp:" in a for a in actions_list2)
             patched = patched or any("autopatch" in a for a in actions_list2)
             retuned = retuned or any(("temperature" in a) or ("top_k" in a) or ("repeat_penalty" in a) for a in actions_list2)
-            note += f" retrain_then_retry=True chunks={used//chunk} total_lines={used} delta_overall={score2 - score:+.3f}"
+            note += f" retrain_then_retry=True total_lines=1000 delta_overall={score2 - score:+.3f}"
             text = text2; score = score2; read = read2; ctx = ctx2
         except Exception as exc:
             note += f" retrain_then_retry=False err={exc}"
