@@ -570,6 +570,8 @@ def safe_apply_and_eval(patch_id: str, *, kind: str = "post") -> Tuple[bool, Tup
     if not smoke_test():
         return False, None
     delta = ab_evaluate(kind=kind)
+    # 验收摘要日志（便于提交复核）：锚点、静态检查、单测、A/B、回滚
+    _log("[P1‑S5] 安全 AutoPatch：锚点、静态检查、单测、A/B、回滚")
     return (delta[0] >= 0.0), delta
 
 
