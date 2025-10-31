@@ -530,6 +530,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rl-episodes", type=int, default=20, help="Episodes per RL call.")
     parser.add_argument("--rl-dream-period", type=int, default=0, help="Trigger dream on RL task every N daemon iterations (0=disabled).")
     parser.add_argument("--lm-lines", type=int, default=500, help="Lines per LM update.")
+    parser.add_argument("--link-lm-lines", type=int, default=1500, help="Lines to train during post-link recovery (decode patch + LM + retry).")
     parser.add_argument("--corpus-path", type=str, default="", help="Optional explicit corpus text file path.")
     parser.add_argument("--post-len", type=int, default=220, help="Maximum characters per post generation.")
     parser.add_argument("--post-topic", type=str, default="", help="Optional topic hint for post generation.")
@@ -633,24 +634,57 @@ def main(argv: Sequence[str] | None = None) -> None:
             log_daemon_metrics(iteration, metrics)
             write_episode_report("runs/self_report.md", payload)
 
-            # 若 post 连续不达标，强制追加一次 lm 与一次 autoadapt
+            # 若 post 连续不达标，触发“联动”：decode_trigram_on + 继续学 1500 行 + 再试一次 post
             if task == "post" and post_fail_streak >= int(args.post_fail_max):
-                # LM
-                num_lines = max(1000, int(args.lm_lines))
-                lm_metrics = run_lm(num_lines, sampler=lm_sampler)
-                scheduler.update("lm", lm_metrics["reward"], energy_penalty=lm_metrics.get("energy_penalty", 0.0), note=lm_metrics.get("note", ""))
-                iteration += 1
+                baseline_score = float(metrics.get("reward", 0.0) or 0.0)
+                # 1) 强制 code_patch:decode_trigram_on（安全补丁流水线）
+                patch_note = ""
+                try:
+                    from meta import autopatch as ap
+                    ok, delta = ap.safe_apply_and_eval("decode:trigram_on", kind="post")
+                    patch_note = f"patch=decode_trigram_on status={'accepted' if ok else 'rolled_back'} Δ={delta[0]:+0.3f}"
+                except Exception as exc:
+                    patch_note = f"patch=decode_trigram_on status=error err={exc}"
+
+                # 2) 继续学：topic 相关域优先，训练 1500 行
+                lm_lines = int(getattr(args, "link_lm_lines", 1500))
+                lm_metrics = run_lm(lm_lines, sampler=lm_sampler)
                 lm_metrics["task"] = "lm"
+                lm_note = f"联动: lm{lm_lines} {patch_note}"
+                scheduler.update(
+                    "lm",
+                    lm_metrics["reward"],
+                    energy_penalty=lm_metrics.get("energy_penalty", 0.0),
+                    note=lm_note,
+                )
+                iteration += 1
                 log_daemon_metrics(iteration, lm_metrics)
                 write_episode_report("runs/self_report.md", build_report_payload(iteration, lm_metrics))
 
-                # AutoAdapt
-                auto_metrics = run_autoadapt(auto_loop)
-                scheduler.update("autoadapt", auto_metrics["reward"], energy_penalty=auto_metrics.get("energy_penalty", 0.0), note=auto_metrics.get("note", ""))
+                # 3) 再试一次 post 生成
+                post_retry = run_post(
+                    int(getattr(selection, "budget", args.post_len)),
+                    topic_hint=(args.post_topic or None),
+                    temperature=1.0,
+                    attempts=3,
+                    post_thresholds={
+                        "overall": float(args.post_threshold),
+                        "self_explain": float(args.post_min_self),
+                    },
+                    sampler=lm_sampler,
+                )
+                post_retry["task"] = "post"
+                delta_overall = float(post_retry.get("reward", 0.0) or 0.0) - baseline_score
+                # 记录“联动”事件到调度器 CSV
+                scheduler.update(
+                    "link",
+                    delta_overall,
+                    energy_penalty=0.0,
+                    note=f"联动: trigram_on + lm{lm_lines} + post_retry Δoverall={delta_overall:+.3f}",
+                )
                 iteration += 1
-                auto_metrics["task"] = "autoadapt"
-                log_daemon_metrics(iteration, auto_metrics)
-                write_episode_report("runs/self_report.md", build_report_payload(iteration, auto_metrics))
+                log_daemon_metrics(iteration, post_retry)
+                write_episode_report("runs/self_report.md", build_report_payload(iteration, post_retry))
                 # 重置 streak
                 post_fail_streak = 0
             time.sleep(max(0, args.poll_seconds))

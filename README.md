@@ -311,3 +311,21 @@ journalctl --user -u smsa-daemon -f  # 查看日志
 - **P0**：GridWorld 环境、策略头、元控制最小闭环、在线 e-prop、基本单测。
 - **P1**：Self-Model、合成学习信号、代码热补丁 / 增删神经元 / inner_steps 的自改与回滚。
 - **P2**：外部语料（字符级 NTP）、域采样（UCB）+ 自调参、回放 / 梦想（可选）。
+### Post 联动策略（连续不达标时的自动干预）
+
+- 触发条件：连续 N 次（默认 2，`--post-fail-max` 可调）post 总分 `overall` 未达阈值（`--post-threshold`）或 tokens<80。
+- 联动动作（按顺序）：
+  1) 强制执行 `code_patch:decode_trigram_on`（A/B 验证后保留或回滚，详见 runs/autopatch.log 与 runs/contracts_log.csv）。
+  2) 继续学 `train_lines(L)`，默认 `L=1500`，可用 `--link-lm-lines` 指定；域选择优先匹配 `--post-topic`（文件名/元数据）。
+  3) 立即再生成一次 post（记录 Δoverall）。
+- 审计与报告：
+  - `runs/scheduler.csv` 追加一条 `task=link` 的“联动”事件，`note` 包含 “联动: trigram_on + lm{L} + post_retry Δoverall=...”。
+  - `runs/self_report.md` 写入本次 post 再试条目；Reporter 会输出校准话术、空样本标注与（若为 RL）能耗箭头。
+
+示例（更易触发联动）：
+
+```bash
+python scripts/daemon.py --loops post --poll-seconds 0 --max-iterations 12 \
+  --post-len 160 --post-topic 学习 --post-fail-max 2 --post-threshold 0.80 \
+  --link-lm-lines 1500
+```
