@@ -49,7 +49,8 @@ LM_STATE_PATH = Path("runs/corpus_state.json")
 ENERGY_COEFF_RL = 0.001
 ENERGY_COEFF_LM = 0.0005
 ENERGY_COEFF_POST = 0.0002
-POST_FAIL_MAX = 3  # 连续不达标次数阈值（默认 3）
+# 连续不达标次数阈值（默认 2，允许通过 --post-fail-max 调整至 2~3）
+POST_FAIL_MAX = 2
 
 _RL_HISTORY: Dict[str, float | None] = {"avg_return": None}
 
@@ -534,7 +535,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--corpus-path", type=str, default="", help="Optional explicit corpus text file path.")
     parser.add_argument("--post-len", type=int, default=220, help="Maximum characters per post generation.")
     parser.add_argument("--post-topic", type=str, default="", help="Optional topic hint for post generation.")
-    parser.add_argument("--post-fail-max", type=int, default=POST_FAIL_MAX, help="Max consecutive under-threshold posts before forced lm+autoadapt.")
+    parser.add_argument(
+        "--post-fail-max",
+        type=int,
+        default=POST_FAIL_MAX,
+        help=(
+            "Max consecutive under-threshold posts before triggering linkage: "
+            "code_patch:decode_trigram_on + train_lines(1500) + post retry."
+        ),
+    )
     parser.add_argument("--post-threshold", type=float, default=0.62, help="Overall score threshold for supervised post.")
     parser.add_argument("--post-min-self", type=float, default=0.40, help="Self-explain score threshold for supervised post.")
     parser.add_argument(
