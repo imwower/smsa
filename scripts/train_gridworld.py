@@ -74,6 +74,11 @@ class EpropGridAgent:
         homeo_kappa: float = 0.01,
         seed: int | None = None,
         gamma_energy: float = 0.0,
+        energy_target_low: float = 0.012,
+        energy_target_high: float = 0.020,
+        energy_gamma: float = 0.5,
+        lambda_min: float = 0.2,
+        lambda_max: float = 3.0,
     ) -> None:
         eta_e = max(1e-6, eta_e)
         lam_e = max(0.0, min(lam_e, 0.999))
@@ -106,6 +111,13 @@ class EpropGridAgent:
         self.homeo_target = max(0.0, float(homeo_target))
         self.homeo_kappa = max(0.0, float(homeo_kappa))
         self.gamma_energy = max(0.0, float(gamma_energy))
+        # 自适应能耗参数
+        self.energy_target_low = float(energy_target_low)
+        self.energy_target_high = float(energy_target_high)
+        self.energy_gamma = float(energy_gamma)
+        self.lambda_min = float(lambda_min)
+        self.lambda_max = float(lambda_max)
+        self._energy_ema = 0.0
         self.reseed(self._seed)
         self.temporal = LinearTemporalUnit(
             n_in=state_size,
@@ -186,6 +198,16 @@ class EpropGridAgent:
         step_spikes = sum(counts) * self.inner_steps
         energy_penalty = self.lambda_energy * (step_spikes / float(hidden_dim))
         advantage -= energy_penalty
+        # 更新 λ(t)：以归一化放电率的 EMA 为基础，朝目标区间的中值调整
+        norm_spike = (sum(counts) / float(hidden_dim)) if hidden_dim > 0 else 0.0
+        # 简单 EMA 平滑
+        self._energy_ema = 0.8 * self._energy_ema + 0.2 * norm_spike
+        r_mid = 0.5 * (self.energy_target_low + self.energy_target_high)
+        self.lambda_energy += self.energy_gamma * (self._energy_ema - r_mid)
+        if self.lambda_energy < self.lambda_min:
+            self.lambda_energy = self.lambda_min
+        if self.lambda_energy > self.lambda_max:
+            self.lambda_energy = self.lambda_max
         # 轻度阈值自稳：v_th ← v_th + κ * (norm_spike - target)
         if self.homeo_on:
             norm_spike = (sum(counts) / float(hidden_dim)) if hidden_dim > 0 else 0.0
@@ -204,6 +226,16 @@ class EpropGridAgent:
         self.policy.update(counts, grad, advantage)
         self.hidden.eprop_apply(third_factor, self.eta_e)
         self.baseline += self.baseline_beta * advantage
+
+    # 供测试：基于给定的归一化放电率更新 λ(t)
+    def _update_lambda_from_norm(self, norm_spike: float) -> None:
+        self._energy_ema = 0.8 * self._energy_ema + 0.2 * norm_spike
+        r_mid = 0.5 * (self.energy_target_low + self.energy_target_high)
+        self.lambda_energy += self.energy_gamma * (self._energy_ema - r_mid)
+        if self.lambda_energy < self.lambda_min:
+            self.lambda_energy = self.lambda_min
+        if self.lambda_energy > self.lambda_max:
+            self.lambda_energy = self.lambda_max
 
     def _append_hidden_neuron(self) -> None:
         for i in range(self.hidden.n_in):
@@ -427,6 +459,8 @@ def train_gridworld(
     homeo_target: float = 0.045,
     homeo_kappa: float = 0.01,
     gamma_energy: float = 0.0,
+    energy_target_low: float = 0.012,
+    energy_target_high: float = 0.020,
 ) -> Dict[str, float]:
     if seed is not None:
         random.seed(seed)
@@ -438,6 +472,11 @@ def train_gridworld(
         lam_e=lam_e,
         intrinsic_beta=intrinsic_beta,
         lambda_energy=lambda_energy,
+        energy_target_low=energy_target_low,
+        energy_target_high=energy_target_high,
+        energy_gamma=gamma_energy if gamma_energy > 0.0 else 0.5,
+        lambda_min=0.2,
+        lambda_max=3.0,
         homeo_on=homeo_on,
         homeo_target=homeo_target,
         homeo_kappa=homeo_kappa,
@@ -710,6 +749,11 @@ def parse_args() -> argparse.Namespace:
         default=0.02,
         help="REINFORCE 优势的能耗惩罚系数 λ (adv -= λ * spikes/hidden_dim)",
     )
+    parser.add_argument("--energy-target-low", type=float, default=0.012, help="能耗目标区间下界")
+    parser.add_argument("--energy-target-high", type=float, default=0.020, help="能耗目标区间上界")
+    parser.add_argument("--energy-gamma", type=float, default=0.5, help="λ 自适应步幅系数")
+    parser.add_argument("--lambda-min", type=float, default=0.2, help="λ 下限")
+    parser.add_argument("--lambda-max", type=float, default=3.0, help="λ 上限")
     parser.add_argument(
         "--save-every",
         type=int,
@@ -891,6 +935,8 @@ def main() -> None:
         homeo_target=args.homeo_target,
         homeo_kappa=args.homeo_kappa,
         gamma_energy=args.gamma_energy,
+        energy_target_low=args.energy_target_low,
+        energy_target_high=args.energy_target_high,
     )
     logger.info("Final metrics: %s", metrics)
 
