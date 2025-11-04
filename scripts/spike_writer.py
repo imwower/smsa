@@ -469,8 +469,8 @@ def run_with_retries(
         base.attempts = attempts
         return base
 
-    # 尝试 1
-    t1, k1, rp1, tb1 = 0.9, 48, 1.10, False
+    # 尝试 1（规范参数组 1）
+    t1, k1, rp1, tb1 = 0.90, 48, 1.10, False
     _DECODE_HISTORY_IDS.clear(); _DECODE_TRIGRAMS.clear()
     a1 = spike_generate(
         max_len=max_len,
@@ -488,8 +488,8 @@ def run_with_retries(
         a1.attempts = attempts
         return a1
 
-    # 尝试 2
-    t2, k2, rp2, tb2 = 0.8, 64, 1.12, False
+    # 尝试 2（规范参数组 2）
+    t2, k2, rp2, tb2 = 0.85, 64, 1.12, True
     _DECODE_HISTORY_IDS.clear(); _DECODE_TRIGRAMS.clear()
     a2 = spike_generate(
         max_len=max_len,
@@ -507,8 +507,8 @@ def run_with_retries(
         a2.attempts = attempts
         return a2
 
-    # 尝试 3
-    t3, k3, rp3, tb3 = 0.8, 72, 1.15, True
+    # 尝试 3（规范参数组 3）
+    t3, k3, rp3, tb3 = 0.80, 72, 1.15, True
     _DECODE_HISTORY_IDS.clear(); _DECODE_TRIGRAMS.clear()
     a3 = spike_generate(
         max_len=max_len,
@@ -526,7 +526,7 @@ def run_with_retries(
         a3.attempts = attempts
         return a3
 
-    # 三次仍不达标：兜底文段（≥80 字，标注“兜底”）
+    # 三次仍不达标：兜底文段（≥80 字，文末标注 [FALLBACK]）
     # 复用最后一次的上下文模型构造逻辑（用 a3 的评分），这里重新构建以取 fallback 概率
     sequences = _gather_sequences(DEFAULT_CORPUS_GLOBS)
     vocab = _build_vocab(sequences)
@@ -534,7 +534,7 @@ def run_with_retries(
     fallback_text = _fallback_paragraph(context_model, vocab, min_chars=MIN_TOKENS)
     # 拼接主题前缀
     topic_prefix = f"主题：{topic_hint}\n" if topic_hint else ""
-    final_text = f"{topic_prefix}{fallback_text}" if topic_prefix else fallback_text
+    final_text = f"{topic_prefix}{fallback_text} [FALLBACK]" if topic_prefix else f"{fallback_text} [FALLBACK]"
 
     # 汇总：以 a3 为基准，替换文本与计数
     a3.text = final_text
