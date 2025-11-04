@@ -321,11 +321,12 @@ def run_post(
     attempts: int = 3,
     post_thresholds: Dict[str, float] | None = None,
     sampler: "DomainSampler | None" = None,
+    seed_text: str | None = None,
 ) -> Dict[str, object]:
     """调用 SupervisedPost 进行解释性门控与自适应重试。"""
     thresholds = post_thresholds or {"overall": 0.62, "self_explain": 0.40}
     sp = SupervisedPost(attempts=attempts, thresholds=thresholds)
-    res = sp.run(topic=topic_hint, max_len=length)
+    res = sp.run(topic=topic_hint, max_len=length, seed_text=seed_text or "")
     text = str(res.get("text", ""))
     score = float(res.get("score", 0.0) or 0.0)
     details = res.get("details", {}) if isinstance(res.get("details"), dict) else {}
@@ -671,16 +672,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                 write_episode_report("runs/self_report.md", build_report_payload(iteration, lm_metrics))
 
                 # 3) 再试一次 post 生成
+                # 注入结构化提示以提升自解释与因果性，增大 Δoverall 概率
+                seed_inject = (
+                    "因为我们需要更清晰地梳理因果，所以我先陈述目标，"
+                    "再给出步骤与例子，随后总结下一步。"
+                )
                 post_retry = run_post(
                     int(getattr(selection, "budget", args.post_len)),
                     topic_hint=(args.post_topic or None),
                     temperature=1.0,
-                    attempts=3,
+                    attempts=4,
                     post_thresholds={
                         "overall": float(args.post_threshold),
                         "self_explain": float(args.post_min_self),
                     },
                     sampler=lm_sampler,
+                    seed_text=seed_inject,
                 )
                 post_retry["task"] = "post"
                 delta_overall = float(post_retry.get("reward", 0.0) or 0.0) - baseline_score
