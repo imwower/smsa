@@ -278,6 +278,15 @@ def _collect_imports(source: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
 _LAST_CONTEXT: Dict[str, object] = {}
 
 
+def render_diff(before: str, after: str, *, path: str = "") -> str:
+    """生成 unified diff 文本（仅标准库）。"""
+    import difflib as _dif
+    before_lines = before.splitlines(keepends=True)
+    after_lines = after.splitlines(keepends=True)
+    diff = _dif.unified_diff(before_lines, after_lines, fromfile=path+"(before)", tofile=path+"(after)")
+    return "".join(diff)
+
+
 def apply_patch(patch_id: str) -> Tuple[List[str], Dict[str, str]]:
     """应用指定补丁并返回 (changed_files, backups)。
 
@@ -339,6 +348,11 @@ def apply_patch(patch_id: str) -> Tuple[List[str], Dict[str, str]]:
 
         _write_text(full_path, after)
         changed.append(str(path))
+        # 记录差异摘要
+        try:
+            _log("diff:\n" + render_diff(before, after, path=str(path)))
+        except Exception:
+            pass
 
     # 缓存上下文，供后续 static/smoke/ab 使用
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -608,6 +622,7 @@ def safe_apply_and_eval(patch_id: str, *, kind: str = "post") -> Tuple[bool, Tup
 __all__ = [
     "apply_patch",
     "revert",
+    "render_diff",
     "static_checks",
     "smoke_test",
     "ab_evaluate",
