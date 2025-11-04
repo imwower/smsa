@@ -22,6 +22,7 @@ from snn.lif import LIFParams, fast_sigmoid_surrogate, triangular_surrogate
 from snn.policy import PolicyHead
 from snn.selfmodel import SelfModel
 from tools.logger import EpisodeMetricsLogger, get_logger, setup_logging
+from tools.checkpoint import auto_save_every, load_agent, load_latest, save_agent
 from tools.config import write_corpus_config_for_path
 from tools.replay import ReplayBuffer
 
@@ -710,6 +711,18 @@ def parse_args() -> argparse.Namespace:
         help="REINFORCE 优势的能耗惩罚系数 λ (adv -= λ * spikes/hidden_dim)",
     )
     parser.add_argument(
+        "--save-every",
+        type=int,
+        default=0,
+        help="每 N 回合自动保存一次检查点（0 关闭）",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default="",
+        help="从检查点恢复（为空则尝试 latest.json）",
+    )
+    parser.add_argument(
         "--homeo",
         type=str,
         choices=["on", "off"],
@@ -880,6 +893,12 @@ def main() -> None:
         gamma_energy=args.gamma_energy,
     )
     logger.info("Final metrics: %s", metrics)
+
+
+# 测试辅助：构建一个最小 Agent 实例供 checkpoint 单测使用
+def build_agent_for_test(hidden: int = 12, seed: int | None = 0) -> EpropGridAgent:
+    cfg = GridWorldConfig()
+    return EpropGridAgent(state_size=cfg.size * cfg.size, hidden_size=hidden, seed=seed)
 
 
 if __name__ == "__main__":
