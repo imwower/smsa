@@ -78,8 +78,17 @@ def _file_entry(path: Path, split: str) -> Dict[str, object]:
         "mtime": stat.st_mtime,
         "samples": 0,
         "pointer": 0,
+        # 训练改进度量（Δppl）：正数表示 PPL 下降
         "delta_history": [],
         "last_delta": 0.0,
+        # 解释性（overall）平均与增量
+        "explain_history": [],
+        "last_explain": 0.0,
+        # 组合奖励历史（按权重整合 -Δppl 与 Δexplain）
+        "reward_history": [],
+        "last_reward": 0.0,
+        # 最近一次记录的 Δppl（供组合奖励对齐）
+        "last_ppl_delta": 0.0,
         "created": _now_ts(),
         "updated": _now_ts(),
     }
@@ -159,7 +168,11 @@ def watch_corpus(
 
 
 class DomainSampler:
-    """Domain-aware sampler that favours files with higher Δppl gains."""
+    """Domain-aware sampler that favours files with higher reward.
+
+    组合奖励 = w_ppl * (-(Δppl)) + w_exp * (Δexplainability.overall)
+    默认权重 w_ppl=0.7, w_exp=0.3。
+    """
 
     def __init__(
         self,
@@ -169,6 +182,8 @@ class DomainSampler:
         window: int = 20,
         ucb_c: float = 0.4,
         seed: Optional[int] = None,
+        reward_alpha_ppl: float = 0.7,
+        reward_beta_explain: float = 0.3,
     ) -> None:
         if split not in _SPLITS:
             raise ValueError(f"未知 split: {split}")
@@ -184,6 +199,15 @@ class DomainSampler:
         self._active: Optional[str] = None
         self._state = _load_state(self.state_path)
         self._files: MutableMapping[str, Dict[str, object]] = self._state["files"]  # type: ignore[assignment]
+        # 组合奖励权重
+        self.w_ppl = float(reward_alpha_ppl)
+        self.w_exp = float(reward_beta_explain)
+        s = self.w_ppl + self.w_exp
+        if s <= 0:
+            self.w_ppl, self.w_exp = 0.7, 0.3
+        else:
+            self.w_ppl /= s
+            self.w_exp /= s
 
     def _refresh(self) -> None:
         self._state = _load_state(self.state_path)
@@ -231,11 +255,16 @@ class DomainSampler:
         return max(total, 1)
 
     def _ucb_score(self, meta: Mapping[str, object], total: int) -> float:
-        history = meta.get("delta_history", [])
-        mean_delta = _mean(history) if isinstance(history, list) else 0.0
+        # 使用组合奖励的滑动均值；回退到 Δppl 均值
+        reward_hist = meta.get("reward_history", [])
+        if isinstance(reward_hist, list) and reward_hist:
+            mean_val = _mean(reward_hist)
+        else:
+            history = meta.get("delta_history", [])
+            mean_val = -_mean(history) if isinstance(history, list) else 0.0
         count = max(1, int(meta.get("samples", 0)))
         bonus = self.ucb_c * math.sqrt(2.0 * math.log(total + 1.0) / float(count))
-        return mean_delta + bonus
+        return float(mean_val) + bonus
 
     def _select_file(self) -> Tuple[str, Dict[str, object]]:
         self._refresh()
@@ -259,6 +288,51 @@ class DomainSampler:
             return gzip.open(path, "rt", encoding="utf-8", errors="ignore")
         return path.open("r", encoding="utf-8", errors="ignore")
 
+    def _avg_explain_overall(self, lines: Sequence[str], topic: str | None) -> float:
+        try:
+            from tools.explainability import explainability_index  # 延迟导入
+        except Exception:
+            return 0.0
+        if not lines:
+            return 0.0
+        sample = list(lines[: min(30, len(lines))])
+        s = 0.0
+        for line in sample:
+            try:
+                ei = explainability_index(line, topic)
+                s += float(ei.get("overall", 0.0) or 0.0)
+            except Exception:
+                continue
+        return s / float(max(1, len(sample)))
+
+    def _update_explain_and_reward(self, key: str, meta: MutableMapping[str, object], observed_lines: Sequence[str]) -> None:
+        topic = str(meta.get("topic", "")) if meta is not None else ""
+        avg_explain = self._avg_explain_overall(observed_lines, topic or None)
+        last_ex = float(meta.get("last_explain", 0.0) or 0.0)
+        delta_ex = avg_explain - last_ex
+        ex_hist = list(meta.get("explain_history", []))
+        ex_hist.append(delta_ex)
+        if len(ex_hist) > self.window:
+            ex_hist = ex_hist[-self.window :]
+        meta["last_explain"] = avg_explain
+        meta["explain_history"] = ex_hist
+
+        last_ppl_delta = float(meta.get("last_ppl_delta", meta.get("last_delta", 0.0)) or 0.0)
+        # 注意：train_lines.record_delta(delta) 约定 delta>0 代表 PPL 下降（正改进），
+        # 因此组合奖励直接使用 +delta_ppl 与 +delta_explain。
+        reward = self.w_ppl * (last_ppl_delta) + self.w_exp * (delta_ex)
+        r_hist = list(meta.get("reward_history", []))
+        r_hist.append(reward)
+        if len(r_hist) > self.window:
+            r_hist = r_hist[-self.window :]
+        meta["last_reward"] = reward
+        meta["reward_history"] = r_hist
+        # 持久化
+        meta["updated"] = _now_ts()
+        self._files[key] = dict(meta)
+        self._state["files"] = dict(self._files)
+        _freeze_state(self.state_path, self._state)
+
     def next_batch(self, num_lines: int) -> Iterator[str]:
         if num_lines <= 0:
             raise ValueError("num_lines 需为正整数")
@@ -275,6 +349,7 @@ class DomainSampler:
         def iterator() -> Iterator[str]:
             nonlocal pointer
             produced = 0
+            observed: List[str] = []
             try:
                 while produced < num_lines:
                     emitted = 0
@@ -285,7 +360,10 @@ class DomainSampler:
                             emitted += 1
                             pointer = idx + 1
                             produced += 1
-                            yield raw.rstrip("\n")
+                            line = raw.rstrip("\n")
+                            if len(observed) < 64:
+                                observed.append(line)
+                            yield line
                             if produced >= num_lines:
                                 break
                     if emitted == 0:
@@ -299,6 +377,11 @@ class DomainSampler:
                 self._files[key] = meta
                 self._state["files"] = dict(self._files)
                 _freeze_state(self.state_path, self._state)
+                # 在批次结束后更新解释性与组合奖励
+                try:
+                    self._update_explain_and_reward(key, meta, observed)
+                except Exception:
+                    pass
 
         return iterator()
 
@@ -323,6 +406,8 @@ class DomainSampler:
             history = history[-self.window :]
         meta["delta_history"] = history
         meta["last_delta"] = float(delta)
+        # 同时记录最近一次 Δppl，供组合奖励计算使用
+        meta["last_ppl_delta"] = float(delta)
         meta["updated"] = _now_ts()
         self._files[key] = meta
         self._state["files"] = dict(self._files)
@@ -337,7 +422,9 @@ class DomainSampler:
                     "path": key,
                     "topic": meta.get("topic"),
                     "samples": meta.get("samples", 0),
+                    "reward_mean": _mean(meta.get("reward_history", [])),
                     "delta_mean": _mean(meta.get("delta_history", [])),
+                    "explain_mean": _mean(meta.get("explain_history", [])),
                 }
             )
         return summary
