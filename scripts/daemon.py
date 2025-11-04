@@ -42,6 +42,8 @@ DAEMON_FIELDS = [
     "relearned",
     "retuned",
     "patched",
+    "grown",
+    "cooldown",
     "note",
 ]
 
@@ -325,6 +327,7 @@ def run_post(
 ) -> Dict[str, object]:
     """调用 SupervisedPost 进行解释性门控与自适应重试。"""
     thresholds = post_thresholds or {"overall": 0.62, "self_explain": 0.40}
+    # 阶段 1：Retune（三段式解码重试由 SupervisedPost 内部执行）
     sp = SupervisedPost(attempts=attempts, thresholds=thresholds)
     res = sp.run(topic=topic_hint, max_len=length, seed_text=seed_text or "")
     text = str(res.get("text", ""))
@@ -346,12 +349,13 @@ def run_post(
     actions_list = list(res.get("actions", []))
     trained = any("ntp:" in a for a in actions_list)
     patched = any("autopatch" in a for a in actions_list)
-    retuned = any(("temperature" in a) or ("top_k" in a) or ("repeat_penalty" in a) for a in actions_list)
+    retuned = any(("temperature" in a) or ("top_k" in a) or ("repeat_penalty" in a) for a in actions_list) or attempts_used > 1
     attempts_used = int(res.get("attempts", 1) or 1)
     best_act = str(res.get("best_action") or "baseline")
     note = f"post attempts={attempts_used} best={best_act} trained={trained} patched={patched} retuned={retuned} feed={Path(text_path).name}"
 
-    # 自动继续学：overall<0.5 或 tokens<80 时触发，优先按 topic 选择域
+    # 阶段 2：Relearn —— overall<0.5 或 tokens<80 时触发；
+    # 每批 600 行，最多 ~3000 行或 3 分钟；域优先匹配 topic。
     def _topic_biased_sampler(base: "DomainSampler | None", topic: str | None):
         if base is None or not topic:
             return base
@@ -395,12 +399,21 @@ def run_post(
 
     tokens = len(text)
     relearned = False
+    grown = False
+    cooled = False
     if (score < 0.5) or (tokens < 80):
         try:
             from scripts.snn_text_lm import train_lines as _train_lines
             biased = _topic_biased_sampler(sampler, topic_hint)
-            # 单次继续学：与 topic 相关的域优先，训练 1000 行后立即再试
-            _ = _train_lines(1000, sampler=biased, valid_interval=500)
+            # 迭代小批训练：600 行/批，最多 5 批或 3 分钟
+            import time as _t
+            _start = _t.time()
+            total = 0
+            for _round in range(5):
+                _ = _train_lines(600, sampler=biased, valid_interval=300)
+                total += 600
+                if (_t.time() - _start) >= 180.0:
+                    break
             relearned = True
             seed_inject = "因为我们观察到目标不够清晰，所以我们先提出问题，再用例子推演，随后总结。"
             sp2 = SupervisedPost(attempts=max(3, attempts))
@@ -431,6 +444,93 @@ def run_post(
             text = text2; score = score2; read = read2; ctx = ctx2
         except Exception as exc:
             note += f" retrain_then_retry=False err={exc}"
+
+    # 阶段 3：Decode-Patch —— 仍不达标则尝试安全补丁 + 5 回合 A/B
+    if (score < thresholds.get("overall", 0.62)) or (len(text) < 80):
+        patch_note = ""
+        try:
+            from meta import autopatch as ap
+            # 依次尝试 decode 补丁：trigram_on → repeat_115 → topk80
+            candidates = ["decode:trigram_on", "decode:repeat_115", "decode:topk80"]
+            for pid in candidates:
+                ok, delta = ap.safe_apply_and_eval(pid, kind="post")
+                d_score = (delta[0] if delta else 0.0) if delta else 0.0
+                d_energy = (delta[1] if delta else 0.0) if delta else 0.0
+                net = d_score - 0.02 * d_energy  # 采用轻度能耗折扣
+                patch_note = f"patch={pid.split(':',1)[1]} status={'accepted' if ok else 'rolled_back'} Δscore={d_score:+.3f} Δenergy={d_energy:+.3f} net={net:+.3f}"
+                if ok and net >= 0.0:
+                    patched = True
+                    break
+            if not patched and not patch_note:
+                patch_note = "patch=none"
+        except Exception as exc:
+            patch_note = f"patch=error err={exc}"
+
+        # 再试一次生成以评估补丁效果
+        sp3 = SupervisedPost(attempts=max(3, attempts), thresholds=thresholds)
+        res3 = sp3.run(topic=topic_hint, max_len=max(length, 200))
+        score3 = float(res3.get("score", 0.0) or 0.0)
+        text3 = str(res3.get("text", ""))
+        details3 = res3.get("details", {}) if isinstance(res3.get("details"), dict) else {}
+        read3 = float(details3.get("readability", 0.0) or 0.0)
+        ctx3 = float(details3.get("context", 0.0) or 0.0)
+        gen3 = GenerationResult(
+            text=text3,
+            tokens_generated=len(text3),
+            spike_estimate=0.0,
+            readability=read3,
+            context=ctx3,
+            notes=list(details3.get("notes", [])) if isinstance(details3.get("notes"), list) else [],
+            attempts=[],
+        )
+        text_path = _write_feed(gen3, topic_hint, length, temperature)
+        note += f" decode_patch: {patch_note}"
+        text = text3; score = score3; read = read3; ctx = ctx3
+
+    # 阶段 4：Micro‑AutoGrow —— 仍不达标：尝试微扩容 + 再试；失败则回滚并 cooldown
+    if (score < thresholds.get("overall", 0.62)) or (len(text) < 80):
+        # 采用文件级 cooldown：runs/autogrow_state.json 记录最近触发时间
+        import json as _json
+        _state_file = Path("runs/autogrow_state.json")
+        _state = {}
+        try:
+            _state = _json.loads(_state_file.read_text(encoding="utf-8")) if _state_file.exists() else {}
+        except Exception:
+            _state = {}
+        import time as _t
+        last = float(_state.get("last_ts", 0.0) or 0.0)
+        if (_t.time() - last) < 600.0:  # 10 分钟冷却期
+            cooled = True
+        else:
+            try:
+                # 通过继续学 + 再试，作为“微扩容”的近似方案（保持纯标准库）
+                from scripts.snn_text_lm import train_lines as _train_lines
+                biased = _topic_biased_sampler(sampler, topic_hint)
+                _ = _train_lines(600, sampler=biased, valid_interval=300)
+                sp4 = SupervisedPost(attempts=max(3, attempts), thresholds=thresholds)
+                res4 = sp4.run(topic=topic_hint, max_len=max(length, 220))
+                score4 = float(res4.get("score", 0.0) or 0.0)
+                text4 = str(res4.get("text", ""))
+                details4 = res4.get("details", {}) if isinstance(res4.get("details"), dict) else {}
+                read4 = float(details4.get("readability", 0.0) or 0.0)
+                ctx4 = float(details4.get("context", 0.0) or 0.0)
+                gen4 = GenerationResult(
+                    text=text4,
+                    tokens_generated=len(text4),
+                    spike_estimate=0.0,
+                    readability=read4,
+                    context=ctx4,
+                    notes=list(details4.get("notes", [])) if isinstance(details4.get("notes"), list) else [],
+                    attempts=[],
+                )
+                text_path = _write_feed(gen4, topic_hint, length, temperature)
+                text = text4; score = score4; read = read4; ctx = ctx4
+                grown = True
+                _state["last_ts"] = _t.time()
+                _state_file.parent.mkdir(parents=True, exist_ok=True)
+                _state_file.write_text(_json.dumps(_state), encoding="utf-8")
+            except Exception:
+                cooled = True
     return {
         "task": "post",
         "reward": score,
@@ -453,6 +553,8 @@ def run_post(
         "post_best_action": best_act,
         "post_trained": trained,
         "post_patched": patched,
+        "post_grown": grown,
+        "post_cooldown": cooled,
         "post_relearned": relearned,
         "post_retuned": retuned,
         "post_threshold_overall": thresholds.get("overall", 0.62),
@@ -515,6 +617,8 @@ def log_daemon_metrics(iteration: int, metrics: Dict[str, object]) -> None:
             "relearned": metrics.get("post_relearned", False),
             "retuned": metrics.get("post_retuned", False),
             "patched": metrics.get("post_patched", False),
+            "grown": metrics.get("post_grown", False),
+            "cooldown": metrics.get("post_cooldown", False),
             "note": metrics.get("note", ""),
         }
     )
@@ -635,11 +739,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 best_act = metrics.get("post_best_action", "baseline")
                 trained = metrics.get("post_trained", False)
                 patched = metrics.get("post_patched", False)
+                grown = metrics.get("post_grown", False)
+                cooled = metrics.get("post_cooldown", False)
                 relearned = metrics.get("post_relearned", False)
                 retuned = metrics.get("post_retuned", False)
                 payload["calibration_note"] = (
-                    f"解释性尝试 {attempts_used} 次；最佳动作 {best_act}；"
-                    f"继续学 {bool(relearned)}；改参 {bool(retuned)}；补丁 {bool(patched)}；训练 {bool(trained)}。"
+                    "观察→诊断→干预→结果→下一步："
+                    f"本轮尝试 {attempts_used} 次解码调参（最佳 {best_act}），"
+                    f"若未达标则按域继续学（已执行={bool(relearned)}），"
+                    f"随后尝试 decode 补丁（已采纳={bool(patched)}），"
+                    f"仍不足则微扩容（grown={bool(grown)}，cooldown={bool(cooled)}）。"
                 )
             log_daemon_metrics(iteration, metrics)
             write_episode_report("runs/self_report.md", payload)
