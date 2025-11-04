@@ -126,6 +126,29 @@ class PolicyHead:
         self.n_in -= 1
         return True
 
+    # --- AutoGrow 接口（保持纯标准库） -------------------------------------
+    def grow_in(self, k: int) -> None:
+        """为每个动作行在末尾追加 k 个小随机权重。"""
+        k = max(0, int(k))
+        for _ in range(k):
+            self._append_input()
+
+    def prune_in(self, idxs: Sequence[int]) -> None:
+        """按列裁剪输入维度（多列）。
+
+        参数 idxs 为需要删除的输入列索引列表，函数内部会按降序删除，
+        以避免移动索引导致的错删。
+        """
+        cols = sorted({int(i) for i in idxs if 0 <= int(i) < self.n_in}, reverse=True)
+        if not cols:
+            return
+        for action in range(self.n_actions):
+            row = self.weights[action]
+            for c in cols:
+                if 0 <= c < len(row):
+                    row.pop(c)
+        self.n_in = max(0, self.n_in - len(cols))
+
     def _append_input(self) -> None:
         init_scale = 0.1
         for action in range(self.n_actions):
