@@ -324,6 +324,7 @@ def run_post(
     post_thresholds: Dict[str, float] | None = None,
     sampler: "DomainSampler | None" = None,
     seed_text: str | None = None,
+    allow_growth: bool = True,
 ) -> Dict[str, object]:
     """调用 SupervisedPost 进行解释性门控与自适应重试。"""
     thresholds = post_thresholds or {"overall": 0.62, "self_explain": 0.40}
@@ -489,6 +490,10 @@ def run_post(
 
     # 阶段 4：Micro‑AutoGrow —— 仍不达标：尝试微扩容 + 再试；失败则回滚并 cooldown
     if (score < thresholds.get("overall", 0.62)) or (len(text) < 80):
+        # 若上层声明冷却中，则跳过增长并标记 cooled
+        if not allow_growth:
+            cooled = True
+        else:
         # 采用文件级 cooldown：runs/autogrow_state.json 记录最近触发时间
         import json as _json
         _state_file = Path("runs/autogrow_state.json")
@@ -499,7 +504,7 @@ def run_post(
             _state = {}
         import time as _t
         last = float(_state.get("last_ts", 0.0) or 0.0)
-        if (_t.time() - last) < 600.0:  # 10 分钟冷却期
+        if (_t.time() - last) < 600.0:  # 时间冷却期（兜底）
             cooled = True
         else:
             try:
@@ -649,6 +654,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "code_patch:decode_trigram_on + train_lines(1500) + post retry."
         ),
     )
+    parser.add_argument(
+        "--post-cooldown",
+        type=int,
+        default=50,
+        help="Post 微扩容动作的冷却回合数（同类动作间隔）。",
+    )
     parser.add_argument("--post-threshold", type=float, default=0.62, help="Overall score threshold for supervised post.")
     parser.add_argument("--post-min-self", type=float, default=0.40, help="Self-explain score threshold for supervised post.")
     parser.add_argument(
@@ -685,6 +696,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     lm_sampler = build_domain_sampler(corpus_path=args.corpus_path or None)
     iteration = read_last_iteration()
     post_fail_streak = 0
+    last_grow_iter: int | None = None
     start_iteration = iteration
     try:
         while True:
@@ -712,6 +724,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "self_explain": float(args.post_min_self),
                     },
                     sampler=lm_sampler,
+                    allow_growth=(last_grow_iter is None or (iteration - last_grow_iter) >= int(args.post_cooldown)),
                 )
                 # 解释性门控：连续不达标则强制调度一次 lm 与 autoadapt
                 passed = (
@@ -752,6 +765,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
             log_daemon_metrics(iteration, metrics)
             write_episode_report("runs/self_report.md", payload)
+
+            # 记录增长发生的回合，用于基于迭代的冷却
+            if task == "post" and bool(metrics.get("post_grown", False)):
+                last_grow_iter = iteration
 
             # 若 post 连续不达标，触发“联动”：decode_trigram_on + 继续学 1500 行 + 再试一次 post
             if task == "post" and post_fail_streak >= int(args.post_fail_max):
