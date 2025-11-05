@@ -350,8 +350,12 @@ def run_post(
     actions_list = list(res.get("actions", []))
     trained = any("ntp:" in a for a in actions_list)
     patched = any("autopatch" in a for a in actions_list)
-    retuned = any(("temperature" in a) or ("top_k" in a) or ("repeat_penalty" in a) for a in actions_list) or attempts_used > 1
+    # 先读取 attempts 再判断是否属于“重调参”
     attempts_used = int(res.get("attempts", 1) or 1)
+    retuned = any(
+        ("temperature" in a) or ("top_k" in a) or ("repeat_penalty" in a)
+        for a in actions_list
+    ) or (attempts_used > 1)
     best_act = str(res.get("best_action") or "baseline")
     note = f"post attempts={attempts_used} best={best_act} trained={trained} patched={patched} retuned={retuned} feed={Path(text_path).name}"
 

@@ -208,10 +208,10 @@ _RECIPES: Dict[str, List[PatchRecipe]] = {
 
 
 def _normalize_patch_id(patch_id: str) -> str:
-    """宽松接受别名：
-    - 将第一个 '_' 或 '-' 视为命名空间分隔符 ':'。
-    - 统一为小写。
-    例如：'surrogate_rect'、'surrogate-rect' → 'surrogate:rect'
+    """宽松接受别名并折叠常见写法：
+    - 第一个 '_' 或 '-' 视为命名空间分隔符 ':'；
+    - 统一为小写；
+    - decode 的若干别名归并（如 topk_80 → topk80）。
     """
     pid = patch_id.strip().lower()
     if ':' not in pid:
@@ -219,7 +219,17 @@ def _normalize_patch_id(patch_id: str) -> str:
             if sep in pid:
                 pid = pid.replace(sep, ':', 1)
                 break
-    return pid
+    # 进一步归并 decode 的常见别名
+    alias_map = {
+        'decode:topk_80': 'decode:topk80',
+        'decode_topk_80': 'decode:topk80',
+        'decode-topk-80': 'decode:topk80',
+        'decode:repeat-115': 'decode:repeat_115',
+        'decode_repeat_115': 'decode:repeat_115',
+        'surrogate-rect': 'surrogate:rect',
+        'surrogate_rect': 'surrogate:rect',
+    }
+    return alias_map.get(pid, pid)
 
 
 def _read_text(path: Path) -> str:
@@ -456,13 +466,13 @@ def static_checks(changed_files: Sequence[str]) -> bool:
                 if "DECODE_TOP_K" in block:
                     vals = [int(x) for x in _re.findall(r"DECODE_TOP_K\s*=\s*([0-9]+)", block)]
                     for v in vals:
-                        if not (10 <= v <= 200):
+                        if not (10 <= v <= 128):
                             ok = False
                             reasons.append(f"DECODE_TOP_K 超界: {v}")
                 if "DECODE_REPEAT_PENALTY" in block:
                     vals = [float(x) for x in _re.findall(r"DECODE_REPEAT_PENALTY\s*=\s*([0-9]*\.?[0-9]+)", block)]
                     for v in vals:
-                        if not (1.0 <= v <= 3.0):
+                        if not (1.0 <= v <= 2.0):
                             ok = False
                             reasons.append(f"DECODE_REPEAT_PENALTY 超界: {v}")
 
