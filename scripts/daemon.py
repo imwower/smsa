@@ -494,48 +494,48 @@ def run_post(
         if not allow_growth:
             cooled = True
         else:
-        # 采用文件级 cooldown：runs/autogrow_state.json 记录最近触发时间
-        import json as _json
-        _state_file = Path("runs/autogrow_state.json")
-        _state = {}
-        try:
-            _state = _json.loads(_state_file.read_text(encoding="utf-8")) if _state_file.exists() else {}
-        except Exception:
+            # 采用文件级 cooldown：runs/autogrow_state.json 记录最近触发时间
+            import json as _json
+            _state_file = Path("runs/autogrow_state.json")
             _state = {}
-        import time as _t
-        last = float(_state.get("last_ts", 0.0) or 0.0)
-        if (_t.time() - last) < 600.0:  # 时间冷却期（兜底）
-            cooled = True
-        else:
             try:
-                # 通过继续学 + 再试，作为“微扩容”的近似方案（保持纯标准库）
-                from scripts.snn_text_lm import train_lines as _train_lines
-                biased = _topic_biased_sampler(sampler, topic_hint)
-                _ = _train_lines(600, sampler=biased, valid_interval=300)
-                sp4 = SupervisedPost(attempts=max(3, attempts), thresholds=thresholds)
-                res4 = sp4.run(topic=topic_hint, max_len=max(length, 220))
-                score4 = float(res4.get("score", 0.0) or 0.0)
-                text4 = str(res4.get("text", ""))
-                details4 = res4.get("details", {}) if isinstance(res4.get("details"), dict) else {}
-                read4 = float(details4.get("readability", 0.0) or 0.0)
-                ctx4 = float(details4.get("context", 0.0) or 0.0)
-                gen4 = GenerationResult(
-                    text=text4,
-                    tokens_generated=len(text4),
-                    spike_estimate=0.0,
-                    readability=read4,
-                    context=ctx4,
-                    notes=list(details4.get("notes", [])) if isinstance(details4.get("notes"), list) else [],
-                    attempts=[],
-                )
-                text_path = _write_feed(gen4, topic_hint, length, temperature)
-                text = text4; score = score4; read = read4; ctx = ctx4
-                grown = True
-                _state["last_ts"] = _t.time()
-                _state_file.parent.mkdir(parents=True, exist_ok=True)
-                _state_file.write_text(_json.dumps(_state), encoding="utf-8")
+                _state = _json.loads(_state_file.read_text(encoding="utf-8")) if _state_file.exists() else {}
             except Exception:
+                _state = {}
+            import time as _t
+            last = float(_state.get("last_ts", 0.0) or 0.0)
+            if (_t.time() - last) < 600.0:  # 时间冷却期（兜底）
                 cooled = True
+            else:
+                try:
+                    # 通过继续学 + 再试，作为“微扩容”的近似方案（保持纯标准库）
+                    from scripts.snn_text_lm import train_lines as _train_lines
+                    biased = _topic_biased_sampler(sampler, topic_hint)
+                    _ = _train_lines(600, sampler=biased, valid_interval=300)
+                    sp4 = SupervisedPost(attempts=max(3, attempts), thresholds=thresholds)
+                    res4 = sp4.run(topic=topic_hint, max_len=max(length, 220))
+                    score4 = float(res4.get("score", 0.0) or 0.0)
+                    text4 = str(res4.get("text", ""))
+                    details4 = res4.get("details", {}) if isinstance(res4.get("details"), dict) else {}
+                    read4 = float(details4.get("readability", 0.0) or 0.0)
+                    ctx4 = float(details4.get("context", 0.0) or 0.0)
+                    gen4 = GenerationResult(
+                        text=text4,
+                        tokens_generated=len(text4),
+                        spike_estimate=0.0,
+                        readability=read4,
+                        context=ctx4,
+                        notes=list(details4.get("notes", [])) if isinstance(details4.get("notes"), list) else [],
+                        attempts=[],
+                    )
+                    text_path = _write_feed(gen4, topic_hint, length, temperature)
+                    text = text4; score = score4; read = read4; ctx = ctx4
+                    grown = True
+                    _state["last_ts"] = _t.time()
+                    _state_file.parent.mkdir(parents=True, exist_ok=True)
+                    _state_file.write_text(_json.dumps(_state), encoding="utf-8")
+                except Exception:
+                    cooled = True
     return {
         "task": "post",
         "reward": score,

@@ -187,3 +187,71 @@ __all__ = [
     "auto_save_every",
 ]
 
+# --- Best-by-metric retention -------------------------------------------------
+
+def _best_index_path(metric: str) -> Path:
+    safe = metric.replace("/", "_")
+    return Path("runs/checkpoints") / f"best_{safe}.json"
+
+
+def save_best(
+    agent: Any,
+    metric_name: str,
+    metric_value: float,
+    *,
+    top_k: int = 2,
+    dir: str | Path = "runs/checkpoints",
+) -> str:
+    """Save a checkpoint if it belongs to top-K for the given metric.
+
+    Keeps a JSON index runs/checkpoints/best_{metric}.json sorted by the
+    metric (higher is better by default; ppl-like metrics are treated as lower-is-better).
+    """
+    dirp = Path(dir)
+    dirp.mkdir(parents=True, exist_ok=True)
+    # Determine direction: lower is better for metrics containing 'ppl'
+    lower_better = ("ppl" in metric_name.lower())
+    # Materialize a checkpoint file name
+    stamp = int(time.time())
+    tag = f"{metric_name}_{metric_value:.4f}_{stamp}"
+    path = dirp / f"ckpt_{tag}.pkl.gz"
+    save_agent(agent, path)
+    # Load existing index
+    index_path = _best_index_path(metric_name)
+    entries: list[dict] = []
+    if index_path.exists():
+        try:
+            entries = json.loads(index_path.read_text(encoding="utf-8")) or []
+        except Exception:
+            entries = []
+    entries.append({
+        "path": str(path),
+        "metric": metric_name,
+        "value": float(metric_value),
+        "ts": stamp,
+    })
+    # Sort and keep top-K
+    entries.sort(key=lambda e: float(e.get("value", 0.0)), reverse=not lower_better)
+    if len(entries) > max(1, int(top_k)):
+        entries = entries[: int(top_k)]
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_bytes(index_path, json.dumps(entries, ensure_ascii=False, indent=2).encode("utf-8"))
+    return str(path)
+
+
+def load_best(metric_name: str) -> str | None:
+    """Return the best checkpoint path for a given metric if available."""
+    index_path = _best_index_path(metric_name)
+    if not index_path.exists():
+        return None
+    try:
+        entries = json.loads(index_path.read_text(encoding="utf-8")) or []
+    except Exception:
+        return None
+    if not entries:
+        return None
+    return str(entries[0].get("path")) or None
+
+
+# Update public API
+__all__.extend(["save_best", "load_best"])

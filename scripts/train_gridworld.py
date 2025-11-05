@@ -76,6 +76,7 @@ class EpropGridAgent:
         gamma_energy: float = 0.0,
         energy_target_low: float = 0.012,
         energy_target_high: float = 0.020,
+        energy_ema: float = 0.8,
         energy_gamma: float = 0.5,
         lambda_min: float = 0.2,
         lambda_max: float = 3.0,
@@ -104,6 +105,8 @@ class EpropGridAgent:
         self.surrogate_name = "fast_sigmoid"
         self._seed = seed or 0
         self._policy_seed = self._seed
+        # Autogrow cooldown guard (time-based; coarse for unit tests)
+        self._last_grow_ts: float | None = None
         # 能耗惩罚系数（用于优势函数调整）
         self.lambda_energy = max(0.0, float(lambda_energy))
         # 轻度阈值自稳：将放电率朝目标收敛
@@ -117,6 +120,8 @@ class EpropGridAgent:
         self.energy_gamma = float(energy_gamma)
         self.lambda_min = float(lambda_min)
         self.lambda_max = float(lambda_max)
+        # 指数滑动平均的历史权重系数（上一期权重），用于平滑尖峰率
+        self.energy_ema = max(0.0, min(0.999, float(energy_ema)))
         self._energy_ema = 0.0
         self.reseed(self._seed)
         self.temporal = LinearTemporalUnit(
@@ -201,7 +206,8 @@ class EpropGridAgent:
         # 更新 λ(t)：以归一化放电率的 EMA 为基础，朝目标区间的中值调整
         norm_spike = (sum(counts) / float(hidden_dim)) if hidden_dim > 0 else 0.0
         # 简单 EMA 平滑
-        self._energy_ema = 0.8 * self._energy_ema + 0.2 * norm_spike
+        ema = self.energy_ema
+        self._energy_ema = ema * self._energy_ema + (1.0 - ema) * norm_spike
         r_mid = 0.5 * (self.energy_target_low + self.energy_target_high)
         self.lambda_energy += self.energy_gamma * (self._energy_ema - r_mid)
         if self.lambda_energy < self.lambda_min:
@@ -229,7 +235,8 @@ class EpropGridAgent:
 
     # 供测试：基于给定的归一化放电率更新 λ(t)
     def _update_lambda_from_norm(self, norm_spike: float) -> None:
-        self._energy_ema = 0.8 * self._energy_ema + 0.2 * norm_spike
+        ema = self.energy_ema
+        self._energy_ema = ema * self._energy_ema + (1.0 - ema) * norm_spike
         r_mid = 0.5 * (self.energy_target_low + self.energy_target_high)
         self.lambda_energy += self.energy_gamma * (self._energy_ema - r_mid)
         if self.lambda_energy < self.lambda_min:
@@ -294,9 +301,15 @@ class EpropGridAgent:
             self.inner_steps = max(self.inner_steps - 2, self.min_inner_steps)
             return True, f"inner_steps={self.inner_steps}"
         if action == "add_neuron":
+            # time-based cooldown (~1s) to avoid rapid consecutive growth in tests
+            import time as _t
+            now = _t.time()
+            if self._last_grow_ts is not None and (now - self._last_grow_ts) < 1.0:
+                return False, None
             if self.hidden.n_out >= self.max_hidden:
                 return False, None
             self._append_hidden_neuron()
+            self._last_grow_ts = now
             return True, f"n_hidden={self.hidden.n_out}"
         if action == "prune_neuron":
             if not self._remove_hidden_neuron():
@@ -461,6 +474,7 @@ def train_gridworld(
     gamma_energy: float = 0.0,
     energy_target_low: float = 0.012,
     energy_target_high: float = 0.020,
+    energy_ema: float = 0.8,
 ) -> Dict[str, float]:
     if seed is not None:
         random.seed(seed)
@@ -474,6 +488,7 @@ def train_gridworld(
         lambda_energy=lambda_energy,
         energy_target_low=energy_target_low,
         energy_target_high=energy_target_high,
+        energy_ema=energy_ema,
         energy_gamma=gamma_energy if gamma_energy > 0.0 else 0.5,
         lambda_min=0.2,
         lambda_max=3.0,
@@ -583,8 +598,9 @@ def train_gridworld(
             # 每 N 回合打印一次能耗相关信息（不改 CSV 结构）
             if episode % 10 == 0:
                 logger.info(
-                    "Energy: norm_spikes=%.4f energy_penalty=%.4f lambda=%.3f",
+                    "Energy: norm_spikes=%.4f ema_spikes=%.4f energy_penalty=%.4f lambda=%.3f",
                     float(avg_norm_spikes),
+                    float(agent._energy_ema),
                     float(avg_energy_penalty),
                     float(agent.lambda_energy),
                 )
@@ -752,6 +768,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--energy-target-low", type=float, default=0.012, help="能耗目标区间下界")
     parser.add_argument("--energy-target-high", type=float, default=0.020, help="能耗目标区间上界")
     parser.add_argument("--energy-gamma", type=float, default=0.5, help="λ 自适应步幅系数")
+    parser.add_argument("--energy-ema", type=float, default=0.8, help="归一化尖峰率 EMA 历史权重 (0..1)")
     parser.add_argument("--lambda-min", type=float, default=0.2, help="λ 下限")
     parser.add_argument("--lambda-max", type=float, default=3.0, help="λ 上限")
     parser.add_argument(
@@ -937,6 +954,7 @@ def main() -> None:
         gamma_energy=args.gamma_energy,
         energy_target_low=args.energy_target_low,
         energy_target_high=args.energy_target_high,
+        energy_ema=args.energy_ema,
     )
     logger.info("Final metrics: %s", metrics)
 

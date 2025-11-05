@@ -144,6 +144,18 @@ _RECIPES: Dict[str, List[PatchRecipe]] = {
             ),
         )
     ],
+    # 兼容别名（外部可能以 decode_topk_80 调用）
+    "decode:topk_80": [
+        PatchRecipe(
+            file=DECODE_FILE,
+            strategy="anchor-replace",
+            anchor="decode_params",
+            content=(
+                "# 默认解码参数（可由 AutoPatch 在锚点内调整)\n"
+                "DECODE_TOP_K = 80\n\nDECODE_REPEAT_PENALTY = 1.1\n"
+            ),
+        )
+    ],
     # Spike-Writer：重复惩罚 1.15（保持当前 top-k 不变或显式设置）
     "decode:repeat_115": [
         PatchRecipe(
