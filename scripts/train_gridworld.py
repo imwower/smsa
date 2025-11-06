@@ -645,9 +645,33 @@ def train_once(
     env_cfg: GridWorldConfig | None = None,
     use_dream: bool = False,
     dream_every: int = 0,
+    # Energy/homeostasis overrides (optional; used by daemon)
+    homeo_on: bool | None = None,
+    energy_target_low: float | None = None,
+    energy_target_high: float | None = None,
+    energy_ema: float | None = None,
+    energy_gamma: float | None = None,
+    lambda_min: float | None = None,
+    lambda_max: float | None = None,
 ) -> Tuple[float, float, float]:
     """Lightweight train loop used by background daemons."""
     env_cfg = env_cfg or GridWorldConfig()
+    # Build agent with optional energy/homeo overrides
+    kwargs: dict = {}
+    if homeo_on is not None:
+        kwargs["homeo_on"] = bool(homeo_on)
+    if energy_target_low is not None:
+        kwargs["energy_target_low"] = float(energy_target_low)
+    if energy_target_high is not None:
+        kwargs["energy_target_high"] = float(energy_target_high)
+    if energy_ema is not None:
+        kwargs["energy_ema"] = float(energy_ema)
+    if energy_gamma is not None:
+        kwargs["energy_gamma"] = float(energy_gamma)
+    if lambda_min is not None:
+        kwargs["lambda_min"] = float(lambda_min)
+    if lambda_max is not None:
+        kwargs["lambda_max"] = float(lambda_max)
     agent = EpropGridAgent(
         state_size=env_cfg.size * env_cfg.size,
         inner_steps=12,
@@ -655,6 +679,7 @@ def train_once(
         lam_e=0.9,
         intrinsic_beta=0.35,
         seed=seed,
+        **kwargs,
     )
     visit_counts: DefaultDict[int, int] = collections.defaultdict(int)
     total_reward = 0.0

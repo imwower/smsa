@@ -218,7 +218,13 @@ class AutoAdaptLoop:
         }
 
 
-def run_rl(episodes: int, *, iteration: int | None = None, dream_period: int = 0) -> Dict[str, object]:
+def run_rl(
+    episodes: int,
+    *,
+    iteration: int | None = None,
+    dream_period: int = 0,
+    energy_cfg: Dict[str, object] | None = None,
+) -> Dict[str, object]:
     """Run a short RL session; optionally enable dream every N daemon iterations."""
     use_dream = False
     dream_every = 0
@@ -226,11 +232,19 @@ def run_rl(episodes: int, *, iteration: int | None = None, dream_period: int = 0
         if (iteration % dream_period) == 0:
             use_dream = True
             dream_every = 1  # trigger dream rollout each episode this round
+    cfg = energy_cfg or {}
     avg_return, success_rate, spikes = train_once(
         episodes=episodes,
         seed=int(time.time()) & 0xFFFF,
         use_dream=use_dream,
         dream_every=dream_every,
+        homeo_on=cfg.get("homeo_on"),
+        energy_target_low=cfg.get("energy_target_low"),
+        energy_target_high=cfg.get("energy_target_high"),
+        energy_ema=cfg.get("energy_ema"),
+        energy_gamma=cfg.get("energy_gamma"),
+        lambda_min=cfg.get("lambda_min"),
+        lambda_max=cfg.get("lambda_max"),
     )
     prev = _RL_HISTORY.get("avg_return")
     delta_return = avg_return - prev if isinstance(prev, (int, float)) else avg_return
@@ -664,6 +678,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=50,
         help="Post 微扩容动作的冷却回合数（同类动作间隔）。",
     )
+    # Energy/homeostasis parameters for RL path
+    parser.add_argument("--homeo", type=str, choices=["on", "off"], default="on", help="阈值自稳开关（RL）")
+    parser.add_argument("--energy-target-low", type=float, default=0.012, help="能耗目标下界（RL）")
+    parser.add_argument("--energy-target-high", type=float, default=0.020, help="能耗目标上界（RL）")
+    parser.add_argument("--energy-ema", type=float, default=0.8, help="尖峰率 EMA 系数（RL）")
+    parser.add_argument("--energy-gamma", type=float, default=0.5, help="λ(t) 调整步幅（RL）")
+    parser.add_argument("--lambda-min", type=float, default=0.2, help="λ 下限（RL）")
+    parser.add_argument("--lambda-max", type=float, default=3.0, help="λ 上限（RL）")
+    parser.add_argument("--enable_autogrow", action="store_true", help="允许 Post 阶段微扩容")
+    parser.add_argument("--resume", type=str, default="", help="预留：恢复策略（如 latest/best_return），当前仅记录")
     parser.add_argument("--post-threshold", type=float, default=0.62, help="Overall score threshold for supervised post.")
     parser.add_argument("--post-min-self", type=float, default=0.40, help="Self-explain score threshold for supervised post.")
     parser.add_argument(
@@ -712,7 +736,20 @@ def main(argv: Sequence[str] | None = None) -> None:
                 continue
             if task == "rl":
                 episodes = int(getattr(selection, "budget", args.rl_episodes))
-                metrics = run_rl(episodes, iteration=iteration + 1, dream_period=int(args.rl_dream_period))
+                metrics = run_rl(
+                    episodes,
+                    iteration=iteration + 1,
+                    dream_period=int(args.rl_dream_period),
+                    energy_cfg={
+                        "homeo_on": (args.homeo == "on"),
+                        "energy_target_low": float(args.energy_target_low),
+                        "energy_target_high": float(args.energy_target_high),
+                        "energy_ema": float(args.energy_ema),
+                        "energy_gamma": float(args.energy_gamma),
+                        "lambda_min": float(args.lambda_min),
+                        "lambda_max": float(args.lambda_max),
+                    },
+                )
             elif task == "lm":
                 num_lines = int(getattr(selection, "budget", args.lm_lines))
                 metrics = run_lm(num_lines, sampler=lm_sampler)
@@ -728,7 +765,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "self_explain": float(args.post_min_self),
                     },
                     sampler=lm_sampler,
-                    allow_growth=(last_grow_iter is None or (iteration - last_grow_iter) >= int(args.post_cooldown)),
+                    allow_growth=(
+                        bool(getattr(args, "enable_autogrow", False))
+                        and (last_grow_iter is None or (iteration - last_grow_iter) >= int(args.post_cooldown))
+                    ),
                 )
                 # 解释性门控：连续不达标则强制调度一次 lm 与 autoadapt
                 passed = (
