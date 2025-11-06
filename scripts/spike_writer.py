@@ -302,7 +302,14 @@ def spike_generate(
     rng_seed: int | None = None,
 ) -> GenerationResult:
     """基于 TextSNNLM 的尖峰生成循环。"""
-    sequences = _gather_sequences(_default_corpus_inputs())
+    inputs = _default_corpus_inputs()
+    sequences = _gather_sequences(inputs)
+    if not sequences:
+        raise RuntimeError(
+            "未找到训练语料：请先下载 HF 数据集，例如\n"
+            "  python scripts/fetch_dataset.py --dataset suolyer/webqa --splits train --output data/hf/webqa\n"
+            "或在 runs/datasets_config.json 填写 train.txt 路径。"
+        )
     vocab = _build_vocab(sequences)
     model = TextSNNLM(vocab_size=len(vocab.id_to_token))
     _warmup_model(model, vocab, sequences, seed=rng_seed or int(time.time()))
@@ -542,7 +549,14 @@ def run_with_retries(
 
     # 三次仍不达标：兜底文段（≥80 字，文末标注 [FALLBACK]）
     # 复用最后一次的上下文模型构造逻辑（用 a3 的评分），这里重新构建以取 fallback 概率
-    sequences = _gather_sequences(_default_corpus_inputs())
+    inputs = _default_corpus_inputs()
+    sequences = _gather_sequences(inputs)
+    if not sequences:
+        raise RuntimeError(
+            "未找到训练语料：请先下载 HF 数据集，例如\n"
+            "  python scripts/fetch_dataset.py --dataset suolyer/webqa --splits train --output data/hf/webqa\n"
+            "或在 runs/datasets_config.json 填写 train.txt 路径。"
+        )
     vocab = _build_vocab(sequences)
     context_model = _build_context_model(sequences)
     fallback_text = _fallback_paragraph(context_model, vocab, min_chars=MIN_TOKENS)

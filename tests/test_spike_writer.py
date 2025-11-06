@@ -15,6 +15,10 @@ def test_min_tokens_and_spikes(tmp_path, monkeypatch):
     # 目标输出目录
     runs_dir = tmp_path / "runs"
     (runs_dir / "feed").mkdir(parents=True, exist_ok=True)
+    # 提供最小 HF 语料：data/hf/webqa/train.txt
+    hf_train = tmp_path / "data" / "hf" / "webqa" / "train.txt"
+    hf_train.parent.mkdir(parents=True, exist_ok=True)
+    hf_train.write_text("Q: A?\nA: B\n\nQ: C?\nA: D\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
 
     result = sw.run_with_retries(
@@ -38,6 +42,10 @@ def test_explainability_logged(tmp_path, monkeypatch):
 
     runs_dir = tmp_path / "runs"
     (runs_dir / "feed").mkdir(parents=True, exist_ok=True)
+    # 提供最小 HF 语料：data/hf/webqa/train.txt
+    hf_train = tmp_path / "data" / "hf" / "webqa" / "train.txt"
+    hf_train.parent.mkdir(parents=True, exist_ok=True)
+    hf_train.write_text("Q: A?\nA: B\n\nQ: C?\nA: D\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
 
     result = sw.run_with_retries(
