@@ -35,9 +35,19 @@ from scripts.snn_text_lm import (  # type: ignore
 )
 from tools.readability import grade
 from tools.explainability import explainability_index
+from tools.config import find_train_corpus_from_config
 
 
-DEFAULT_CORPUS_GLOBS = ["data/seed_*.txt"]
+# 默认使用 HF 展开的本地语料（通过 runs/datasets_config.json 指向或 data/hf/**/train.txt）
+def _default_corpus_inputs() -> list[str]:
+    path = find_train_corpus_from_config()
+    if path:
+        return [str(path)]
+    # 回退：扫描 data/hf/**/train.txt
+    candidates = sorted(Path("data/hf").glob("**/train.txt"))
+    if candidates:
+        return [str(candidates[0])]
+    return []
 MAX_LINES_FOR_BUILD = 1200
 VOCAB_MAX = 2048
 WARMUP_EPOCHS = 1
@@ -168,10 +178,14 @@ class ContextModel:
     fallback_probs: dict[str, float]
 
 
-def _gather_sequences(patterns: Sequence[str]) -> List[List[str]]:
+def _gather_sequences(inputs: Sequence[str]) -> List[List[str]]:
     paths: List[Path] = []
-    for pattern in patterns:
-        paths.extend(Path().glob(pattern))
+    for item in inputs:
+        p = Path(item)
+        if any(ch in item for ch in "*?[]"):
+            paths.extend(Path().glob(item))
+        elif p.exists():
+            paths.append(p)
     paths = sorted({path.resolve() for path in paths if path.is_file()})
     sequences: List[List[str]] = []
     for path in paths:
@@ -288,7 +302,7 @@ def spike_generate(
     rng_seed: int | None = None,
 ) -> GenerationResult:
     """基于 TextSNNLM 的尖峰生成循环。"""
-    sequences = _gather_sequences(DEFAULT_CORPUS_GLOBS)
+    sequences = _gather_sequences(_default_corpus_inputs())
     vocab = _build_vocab(sequences)
     model = TextSNNLM(vocab_size=len(vocab.id_to_token))
     _warmup_model(model, vocab, sequences, seed=rng_seed or int(time.time()))
@@ -528,7 +542,7 @@ def run_with_retries(
 
     # 三次仍不达标：兜底文段（≥80 字，文末标注 [FALLBACK]）
     # 复用最后一次的上下文模型构造逻辑（用 a3 的评分），这里重新构建以取 fallback 概率
-    sequences = _gather_sequences(DEFAULT_CORPUS_GLOBS)
+    sequences = _gather_sequences(_default_corpus_inputs())
     vocab = _build_vocab(sequences)
     context_model = _build_context_model(sequences)
     fallback_text = _fallback_paragraph(context_model, vocab, min_chars=MIN_TOKENS)
