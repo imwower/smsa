@@ -99,7 +99,15 @@ def build_domain_sampler(corpus_path: str | None = None) -> DomainSampler | None
             pass
         return sampler
 
-    # 3) 回退：data/*.txt
+    # 3) 回退（优先 HF 展开）：data/hf/**/train.txt → data/*.txt
+    hf_candidates = sorted(Path("data/hf").glob("**/train.txt"))
+    if hf_candidates:
+        try:
+            sampler.register(str(hf_candidates[0]), split="train")
+        except Exception:
+            pass
+        return sampler
+
     fallback = list(Path("data").glob("*.txt"))
     for p in fallback:
         try:
