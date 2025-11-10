@@ -1,6 +1,6 @@
 """带资格迹的 LIF 稠密层（e-prop 三因子）。"""
 
-from typing import Callable, List, Sequence, Tuple
+from typing import Callable, List, Sequence, Tuple, Optional
 import math
 import random
 
@@ -22,8 +22,10 @@ class DenseLIF:
         self.n_out = n_out
         self.params = params
         self.set_surrogate(surrogate_fn)
+        # Xavier Uniform 初始化，稳定早期电流尺度与梯度
+        limit = math.sqrt(6.0 / float(max(1, n_in + n_out)))
         self.weights = [
-            [random.uniform(-0.5, 0.5) for _ in range(n_out)] for _ in range(n_in)
+            [random.uniform(-limit, limit) for _ in range(n_out)] for _ in range(n_in)
         ]
         self.bias = [random.uniform(-0.1, 0.1) for _ in range(n_out)]
         if eligibility_lambda is None:
@@ -51,20 +53,56 @@ class DenseLIF:
         self.bias_eligibility = [0.0 for _ in range(self.n_out)]
 
     def step(
-        self, pre_spikes: Sequence[int]
+        self,
+        pre_spikes: Sequence[int],
+        out_elig: Optional[List[List[float]]] = None,
+        out_bias: Optional[List[float]] = None,
+        *,
+        return_snapshots: bool = True,
     ) -> Tuple[List[int], List[float], List[List[float]], List[float]]:
         # 简易性能分析：每 1000 步打印均值（关闭默认开关）
         _t0 = None
         if self._profile_on:
             import time as _t
             _t0 = _t.perf_counter()
+        # 输出缓冲：默认分配新列表；若调用方提供，则原地写入
+        if return_snapshots:
+            if out_elig is None:
+                eligibility_snapshot = [
+                    [0.0 for _ in range(self.n_out)] for _ in range(self.n_in)
+                ]
+            else:
+                eligibility_snapshot = out_elig
+                # 尺寸防御：只在边界内写入
+                for i in range(min(self.n_in, len(eligibility_snapshot))):
+                    row = eligibility_snapshot[i]
+                    if len(row) < self.n_out:
+                        # 补零扩展至 n_out
+                        row.extend([0.0 for _ in range(self.n_out - len(row))])
+                    else:
+                        # 清零复用
+                        for j in range(self.n_out):
+                            row[j] = 0.0
+                # 若提供的行不足 n_in，则补充
+                if len(eligibility_snapshot) < self.n_in:
+                    for _ in range(self.n_in - len(eligibility_snapshot)):
+                        eligibility_snapshot.append([0.0 for _ in range(self.n_out)])
+            if out_bias is None:
+                bias_snapshot = [0.0 for _ in range(self.n_out)]
+            else:
+                bias_snapshot = out_bias
+                if len(bias_snapshot) < self.n_out:
+                    bias_snapshot.extend([0.0 for _ in range(self.n_out - len(bias_snapshot))])
+                else:
+                    for j in range(self.n_out):
+                        bias_snapshot[j] = 0.0
+        else:
+            # 训练快路径：不返回快照，减少分配与清零
+            eligibility_snapshot = []  # type: ignore[assignment]
+            bias_snapshot = []  # type: ignore[assignment]
+
         spikes = [0 for _ in range(self.n_out)]
         psis = [0.0 for _ in range(self.n_out)]
-        # 复用快照缓冲，降低临时分配
-        eligibility_snapshot = [
-            [0.0 for _ in range(self.n_out)] for _ in range(self.n_in)
-        ]
-        bias_snapshot = [0.0 for _ in range(self.n_out)]
         for j in range(self.n_out):
             for i in range(self.n_in):
                 self.eligibility[i][j] *= self.eligibility_lambda
@@ -92,9 +130,11 @@ class DenseLIF:
                 self.a[j] += (-self.a[j] + fired) * self._inv_tau_a
             for i in range(self.n_in):
                 self.eligibility[i][j] += psi * pre_spikes[i]
-                eligibility_snapshot[i][j] = self.eligibility[i][j]
+                if return_snapshots:
+                    eligibility_snapshot[i][j] = self.eligibility[i][j]
             self.bias_eligibility[j] += psi
-            bias_snapshot[j] = self.bias_eligibility[j]
+            if return_snapshots:
+                bias_snapshot[j] = self.bias_eligibility[j]
             psis[j] = psi
         if self._profile_on and _t0 is not None:
             import time as _t
@@ -104,6 +144,41 @@ class DenseLIF:
                 avg = self._profile_acc / float(max(1, self._profile_n))
                 print(f"[DenseLIF] 平均 step 开销 {avg*1e3:.3f} ms （{self._profile_n} 步）")
         return spikes, psis, eligibility_snapshot, bias_snapshot
+
+    def step_sparse(
+        self,
+        active_indices: Sequence[int],
+        values: Optional[Sequence[float]] = None,
+        out_elig: Optional[List[List[float]]] = None,
+        out_bias: Optional[List[float]] = None,
+        *,
+        return_snapshots: bool = True,
+    ) -> Tuple[List[int], List[float], List[List[float]], List[float]]:
+        """稀疏输入的快路径包装：将稀疏向量视图传入 step。
+
+        注意：为保持数值与语义一致，此方法仍需对所有输入维度进行资格迹衰减；
+        真正的 O(k·n_out) 版本需要更大范围的结构调整，这里先提供轻量包装，
+        同时配合 `return_snapshots=False` 减少分配成本。
+        """
+        if values is None:
+            marker = {int(i): 1.0 for i in active_indices}
+            self_n_in = self.n_in
+            class _View:
+                def __len__(self):  # noqa: D401
+                    return self_n_in
+                def __getitem__(self, idx):  # noqa: D401
+                    return marker.get(int(idx), 0.0)
+            pre = _View()
+        else:
+            pairs = {int(i): float(v) for i, v in zip(active_indices, values)}
+            self_n_in = self.n_in
+            class _View:
+                def __len__(self):  # noqa: D401
+                    return self_n_in
+                def __getitem__(self, idx):  # noqa: D401
+                    return pairs.get(int(idx), 0.0)
+            pre = _View()
+        return self.step(pre, out_elig=out_elig, out_bias=out_bias, return_snapshots=return_snapshots)
 
     def eprop_apply(self, learning_signal: Sequence[float], lr: float) -> None:
         """根据学习信号与资格迹更新权重与偏置。"""

@@ -815,10 +815,9 @@ class TextSNNLM:
 
         for _ in range(self.inner_steps):
             spikes = [spike_from_rate(rate) for rate in combined_rates]
-            spike_out, _, eligibility_snapshot, bias_snapshot = self.hidden.step(spikes)
+            spike_out, _psis, _elig, _bias = self.hidden.step(spikes, return_snapshots=False)
             hidden_counts = [count + spike for count, spike in zip(hidden_counts, spike_out)]
-            eligibility_history.append([row[:] for row in eligibility_snapshot])
-            bias_history.append(bias_snapshot[:])
+            # 在 LM 前向中不需要资格迹快照，保持空列表占位即可
 
         hidden_rates = [count / float(self.inner_steps) for count in hidden_counts]
         logits = []

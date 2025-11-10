@@ -69,6 +69,7 @@ class SelfModel:
         reward_weight: float = 0.35,
         energy_weight: float = 0.35,
         cause_weight: float = 0.5,
+        seed: int | None = None,
     ) -> None:
         self.obs_dim = obs_dim
         self.action_dim = action_dim
@@ -109,7 +110,12 @@ class SelfModel:
         ]
         self.cause_bias = [0.0 for _ in range(self.cause_dim)]
 
-        self._rng = random.Random(1234)
+        # 可复现实验：允许传入随机种子
+        self._rng = random.Random(1234 if seed is None else seed)
+
+    def reseed(self, seed: int) -> None:
+        """重置内部采样 RNG（用于对齐 A/B 评估）。"""
+        self._rng.seed(int(seed))
 
     def forward(self, features: Sequence[float]) -> SelfModelState:
         """前向传播，返回预测结果与缓存状态。"""
@@ -119,11 +125,19 @@ class SelfModel:
         self.hidden.reset_state()
         hidden_counts = [0 for _ in range(self.hidden.n_out)]
 
+        # 稀疏视图 + 连续特征直通：one-hot 观测/动作维度直接 0/1，
+        # 连续特征（mean/sum/eta/v_th）按数值直通，减少采样方差。
+        active_idx: list[int] = []
+        values: list[float] = []
+        for i, v in enumerate(features):
+            vv = max(0.0, min(1.0, float(v)))
+            if vv != 0.0:
+                active_idx.append(i)
+                values.append(vv)
         for _ in range(self.inner_steps):
-            spikes_in = [
-                _spike_from_rate(rate, self._rng) for rate in features
-            ]
-            spikes, _, _, _ = self.hidden.step(spikes_in)
+            spikes, _psis, _elig, _b = self.hidden.step_sparse(
+                active_idx, values, return_snapshots=False
+            )
             hidden_counts = [c + s for c, s in zip(hidden_counts, spikes)]
 
         hidden_rates = [count / float(self.inner_steps) for count in hidden_counts]

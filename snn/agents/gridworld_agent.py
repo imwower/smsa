@@ -127,7 +127,7 @@ class GridworldAgent:
     def begin_episode(self) -> None:
         self.temporal_unit.reset()
 
-    def forward(self, state_index: int) -> PolicyState:
+    def forward(self, state_index: int, *, collect_traces: bool = True) -> PolicyState:
         bits = self.encode_state(state_index)
         self.hidden.reset_state()
         hidden_counts = [0 for _ in range(self.hidden.n_out)]
@@ -143,12 +143,18 @@ class GridworldAgent:
             temporal_rates = [max(0.0, min(rate, 1.0)) for rate in temporal_state]
             combined_rates = base_rates + temporal_rates
             pre_spikes = [_spike_from_rate(rate) for rate in combined_rates]
-            spikes, _, eligibility_snapshot, bias_snapshot = self.hidden.step(
-                pre_spikes
-            )
+            if collect_traces:
+                spikes, _psis, eligibility_snapshot, bias_snapshot = self.hidden.step(
+                    pre_spikes, return_snapshots=True
+                )
+            else:
+                spikes, _psis, _elig, _bias = self.hidden.step(
+                    pre_spikes, return_snapshots=False
+                )
             hidden_counts = [c + s for c, s in zip(hidden_counts, spikes)]
-            eligibility_history.append([row[:] for row in eligibility_snapshot])
-            bias_history.append(bias_snapshot[:])
+            if collect_traces:
+                eligibility_history.append([row[:] for row in eligibility_snapshot])
+                bias_history.append(bias_snapshot[:])
         hidden_rates = [count / float(self.inner_steps) for count in hidden_counts]
         logits = []
         for action in range(4):

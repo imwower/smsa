@@ -166,7 +166,7 @@ class EpropGridAgent:
         rates = self._compose_rates(obs)
         for _ in range(self.inner_steps):
             spikes_in = self._sample_spikes(rates)
-            spikes, _psis, _elig, _bias = self.hidden.step(spikes_in)
+            spikes, _psis, _elig, _bias = self.hidden.step(spikes_in, return_snapshots=False)
             for j, fired in enumerate(spikes):
                 counts[j] += fired
         scale = 1.0 / float(max(self.inner_steps, 1))

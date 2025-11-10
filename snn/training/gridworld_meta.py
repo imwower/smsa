@@ -63,7 +63,7 @@ def evaluate_agent(
         agent.begin_episode()
         steps = 0
         while steps < env_cfg.max_steps:
-            pol_state = agent.forward(idx)
+            pol_state = agent.forward(idx, collect_traces=False)
             action = agent.sample_action(pol_state.probs)
             bonus = agent.intrinsic_bonus(visit_counts[idx])
             visit_counts[idx] += 1

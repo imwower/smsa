@@ -33,3 +33,20 @@ def fast_sigmoid_surrogate(u: float, slope: float = 2.0) -> float:
     width = 1.0 / max(1e-6, slope)
     return (slope if -width <= u <= width else 0.0)
 # AUTOPATCH SURROGATE END
+
+
+# 工厂：生成带固定参数的替代导数闭包，避免重复计算常量
+def make_rect_surrogate(*, slope: float = 2.0) -> SurrogateFn:
+    width = 1.0 / max(1e-6, slope)
+    def fn(u: float) -> float:
+        return slope if -width <= u <= width else 0.0
+    return fn
+
+
+def make_triangular_surrogate(*, width: float = 1.0) -> SurrogateFn:
+    w = max(1e-6, float(width))
+    def fn(u: float) -> float:
+        if u >= w or u <= -w:
+            return 0.0
+        return (w - abs(u)) / w
+    return fn
